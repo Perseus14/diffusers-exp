@@ -181,26 +181,47 @@ class WanCausalConv3d(nn.Conv3d):
         # Workaround sharding with name directly. Need to align the callers mesh.
         # TODO: handle padding and calculate from mesh instead of try and not sharding
         success = False
-        try:
-            x = mark_sharding(x, P(None, None, None, None, ("dp", "tp")))
-            success = True
-            print("[DEBUG] Shard conv height along ('dp', 'tp')")
-        except ValueError:
-            pass
-        if not success:
+
+        # Attempt 1: Optimal for Batched Inference
+        # Shard the Batch (Dim 0) across 'dp' and Width (Dim 4) across 'tp'
+        batch_size = x.shape[0]
+        
+        # --- EXPLICIT BATCH ROUTING ---
+        if batch_size == 1:
+            # Batch=1: Safe to shard width aggressively for speed
             try:
-                x = mark_sharding(x, P(None, None, None, None, ("tp")))
+                x = mark_sharding(x, P(None, None, None, None, ("dp", "tp")))
                 success = True
-                print("[DEBUG] Shard conv height along ('tp')")
             except ValueError:
                 pass
-        if not success:
+        else:
+            # Batch=2+: PURE DATA PARALLELISM. 
+            # We drop "tp" from the width completely to prevent the aten::cat crash.
+            # The batch dimension handles all the parallelism we need.
             try:
-                x = mark_sharding(x, P(None, None, None, None, ("dp")))
+                x = mark_sharding(x, P("dp", None, None, None, None))
                 success = True
-                print("[DEBUG] Shard conv height along ('dp')")
             except ValueError:
                 pass
+
+        # Attempt 2: Spatial on TP only
+        if not success:
+            try:
+                x = mark_sharding(x, P(None, None, None, None, "tp"))
+                success = True
+                print("[DEBUG] Shard: Width on 'tp'")
+            except ValueError:
+                pass
+
+        # Attempt 3: Batch on DP only (if spatial width is totally indivisible)
+        if not success:
+            try:
+                x = mark_sharding(x, P("dp", None, None, None, None))
+                success = True
+                print("[DEBUG] Shard: Batch on 'dp'")
+            except ValueError:
+                pass
+
         return super().forward(x)
 
 
