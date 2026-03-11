@@ -66,41 +66,67 @@ DEFAULT_PROFILE_OUT_PATH = "/tmp/wan_prof"
 
 
 # fmt: off
+
+
 TEXT_ENCODER_SHARDINGS = {
-'shared.weight': (('dp','tp'),),
-'encoder.block.*.layer.*.SelfAttention.q.weight': (('dp','tp'),),
-'encoder.block.*.layer.*.SelfAttention.k.weight': (('dp','tp'),),
-'encoder.block.*.layer.*.SelfAttention.v.weight': (('dp','tp'),),
-'encoder.block.*.layer.*.SelfAttention.o.weight': (None, ('dp','tp'),),
-'encoder.block.*.layer.*.DenseReluDense.wi_0.weight': (('dp','tp'),),
-'encoder.block.*.layer.*.DenseReluDense.wi_1.weight': (('dp','tp'),),
-'encoder.block.*.layer.*.DenseReluDense.wo.weight': (None, ('dp','tp'),),
+'shared.weight': (('dp','tp'),), # (torch.Size([256384, 4096]), torch.bfloat16)
+'encoder.block.*.layer.*.SelfAttention.q.weight': (('dp','tp'),), # (torch.Size([4096, 4096]), torch.bfloat16)
+'encoder.block.*.layer.*.SelfAttention.k.weight': (('dp','tp'),), # (torch.Size([4096, 4096]), torch.bfloat16)
+'encoder.block.*.layer.*.SelfAttention.v.weight': (('dp','tp'),), # (torch.Size([4096, 4096]), torch.bfloat16)
+'encoder.block.*.layer.*.SelfAttention.o.weight': (None, ('dp','tp'),), # (torch.Size([4096, 4096]), torch.bfloat16)
+# 'encoder.block.*.layer.*.SelfAttention.relative_attention_bias.weight': (), # (torch.Size([32, 64]), torch.bfloat16)
+# 'encoder.block.*.layer.*.layer_norm.weight': (), # (torch.Size([4096]), torch.bfloat16)
+'encoder.block.*.layer.*.DenseReluDense.wi_0.weight': (('dp','tp'),), # (torch.Size([10240, 4096]), torch.bfloat16)
+'encoder.block.*.layer.*.DenseReluDense.wi_1.weight': (('dp','tp'),), # (torch.Size([10240, 4096]), torch.bfloat16)
+'encoder.block.*.layer.*.DenseReluDense.wo.weight': (None, ('dp','tp'),), # (torch.Size([4096, 10240]), torch.bfloat16)
+# 'encoder.final_layer_norm.weight': (), # (torch.Size([4096]), torch.bfloat16)
 }
 
 TRANSFORMER_SHARDINGS = {
-'condition_embedder.time_embedder.linear_1.weight': ('tp',),
-'condition_embedder.time_embedder.linear_1.bias': ('tp',),
-'condition_embedder.time_embedder.linear_2.weight': (None, 'tp',),
-'condition_embedder.text_embedder.linear_1.weight': ('tp',),
-'condition_embedder.text_embedder.linear_1.bias': ('tp',),
-'condition_embedder.text_embedder.linear_2.weight': (None, 'tp',),
-'blocks.*.attn1.to_q.weight': ('tp',),
-'blocks.*.attn1.to_q.bias': ('tp',),
-'blocks.*.attn1.to_k.weight': ('tp',),
-'blocks.*.attn1.to_k.bias': ('tp',),
-'blocks.*.attn1.to_v.weight': ('tp',),
-'blocks.*.attn1.to_v.bias': ('tp',),
-'blocks.*.attn1.to_out.*.weight': (None, 'tp',),
-'blocks.*.attn2.to_q.weight': ('tp',),
-'blocks.*.attn2.to_q.bias': ('tp',),
-'blocks.*.attn2.to_k.weight': ('tp',),
-'blocks.*.attn2.to_k.bias': ('tp',),
-'blocks.*.attn2.to_v.weight': ('tp',),
-'blocks.*.attn2.to_v.bias': ('tp',),
-'blocks.*.attn2.to_out.*.weight': (None, 'tp',),
-'blocks.*.ffn.net.*.proj.weight': ('tp',),
-'blocks.*.ffn.net.*.proj.bias': ('tp',),
-'blocks.*.ffn.net.*.weight': (None, 'tp',),
+# 'scale_shift_table': (), # (torch.Size([1, 2, 5120]), torch.float32)
+# 'patch_embedding.weight': (), # (torch.Size([5120, 36, 1, 2, 2]), torch.bfloat16)
+# 'patch_embedding.bias': (), # (torch.Size([5120]), torch.bfloat16)
+'condition_embedder.time_embedder.linear_1.weight': ('tp',), # (torch.Size([5120, 256]), torch.float32)
+'condition_embedder.time_embedder.linear_1.bias': ('tp',), # (torch.Size([5120]), torch.float32)
+'condition_embedder.time_embedder.linear_2.weight': (None, 'tp',), # (torch.Size([5120, 5120]), torch.float32)
+# 'condition_embedder.time_embedder.linear_2.bias': (), # (torch.Size([5120]), torch.float32)
+# 'condition_embedder.time_proj.weight': (), # (torch.Size([30720, 5120]), torch.bfloat16)
+# 'condition_embedder.time_proj.bias': (), # (torch.Size([30720]), torch.bfloat16)
+'condition_embedder.text_embedder.linear_1.weight': ('tp',), # (torch.Size([5120, 4096]), torch.bfloat16)
+'condition_embedder.text_embedder.linear_1.bias': ('tp',), # (torch.Size([5120]), torch.bfloat16)
+'condition_embedder.text_embedder.linear_2.weight': (None, 'tp',), # (torch.Size([5120, 5120]), torch.bfloat16)
+# 'condition_embedder.text_embedder.linear_2.bias': (), # (torch.Size([5120]), torch.bfloat16)
+# 'blocks.*.scale_shift_table': (), # (torch.Size([1, 6, 5120]), torch.float32)
+'blocks.*.attn1.to_q.weight': ('tp',), # (torch.Size([5120, 5120]), torch.bfloat16)
+'blocks.*.attn1.to_q.bias': ('tp',), # (torch.Size([5120]), torch.bfloat16)
+'blocks.*.attn1.to_k.weight': ('tp',), # (torch.Size([5120, 5120]), torch.bfloat16)
+'blocks.*.attn1.to_k.bias': ('tp',), # (torch.Size([5120]), torch.bfloat16)
+'blocks.*.attn1.to_v.weight': ('tp',), # (torch.Size([5120, 5120]), torch.bfloat16)
+'blocks.*.attn1.to_v.bias': ('tp',), # (torch.Size([5120]), torch.bfloat16)
+'blocks.*.attn1.to_out.*.weight': (None, 'tp',), # (torch.Size([5120, 5120]), torch.bfloat16)
+# 'blocks.*.attn1.to_out.*.bias': (), # (torch.Size([5120]), torch.bfloat16)
+# 'blocks.*.attn1.norm_q.weight': (), # (torch.Size([5120]), torch.bfloat16)
+# 'blocks.*.attn1.norm_k.weight': (), # (torch.Size([5120]), torch.bfloat16)
+'blocks.*.attn2.to_q.weight': ('tp',), # (torch.Size([5120, 5120]), torch.bfloat16)
+'blocks.*.attn2.to_q.bias': ('tp',), # (torch.Size([5120]), torch.bfloat16)
+'blocks.*.attn2.to_k.weight': ('tp',), # (torch.Size([5120, 5120]), torch.bfloat16)
+'blocks.*.attn2.to_k.bias': ('tp',), # (torch.Size([5120]), torch.bfloat16)
+'blocks.*.attn2.to_v.weight': ('tp',), # (torch.Size([5120, 5120]), torch.bfloat16)
+'blocks.*.attn2.to_v.bias': ('tp',), # (torch.Size([5120]), torch.bfloat16)
+'blocks.*.attn2.to_out.*.weight': (None, 'tp',), # (torch.Size([5120, 5120]), torch.bfloat16)
+# 'blocks.*.attn2.to_out.*.bias': (), # (torch.Size([5120]), torch.bfloat16)
+# 'blocks.*.attn2.norm_q.weight': (), # (torch.Size([5120]), torch.bfloat16)
+# 'blocks.*.attn2.norm_k.weight': (), # (torch.Size([5120]), torch.bfloat16)
+# 'blocks.*.norm2.weight': (), # (torch.Size([5120]), torch.float32)
+# 'blocks.*.norm2.bias': (), # (torch.Size([5120]), torch.float32)
+'blocks.*.ffn.net.*.proj.weight': ('tp',), # (torch.Size([13824, 5120]), torch.bfloat16)
+'blocks.*.ffn.net.*.proj.bias': ('tp',), # (torch.Size([13824]), torch.bfloat16)
+'blocks.*.ffn.net.*.weight': (None, 'tp',), # (torch.Size([5120, 13824]), torch.bfloat16)
+# 'blocks.*.ffn.net.*.bias': (), # (torch.Size([5120]), torch.bfloat16)
+# 'proj_out.weight': (), # (torch.Size([64, 5120]), torch.bfloat16)
+# 'proj_out.bias': (), # (torch.Size([64]), torch.bfloat16)
+# 'rope.freqs_cos': (), # (torch.Size([1024, 128]), torch.float32)
+# 'rope.freqs_sin': (), # (torch.Size([1024, 128]), torch.float32)
 }
 
 VAE_ENCODER_SHARDINGS = {}
@@ -418,10 +444,21 @@ def parse_args():
         default=2,
         help="Data parallelism for positive prompt and negative prompt.",
     )
+    
+    parser.add_argument("--bq", type=int, default=2048, help="Query block size for Splash Attention")
+    parser.add_argument("--bkv", type=int, default=2048, help="KV block size for Splash Attention")
+    parser.add_argument("--bkv_compute", type=int, default=1024, help="Compute block size for Splash Attention")
+    parser.add_argument("--bkv_compute_in", type=int, default=1024, help="Input block size for Splash Attention")
+
     return parser.parse_args(namespace=Args())
 
 
 def main(args: Args):
+    global BQSIZE, BKVSIZE, BKVCOMPUTESIZE, BKVCOMPUTEINSIZE
+    BQSIZE = args.bq
+    BKVSIZE = args.bkv
+    BKVCOMPUTESIZE = args.bkv_compute
+    BKVCOMPUTEINSIZE = args.bkv_compute_in
     torch.set_default_dtype(torch.bfloat16)
 
     # Changed from I2V model to standard T2V model
