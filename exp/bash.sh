@@ -6,7 +6,6 @@ export HF_HUB_CACHE=/dev/shm/hf_cache && \
 export XLA_PYTHON_CLIENT_MEM_FRACTION=0.95 && \
 export JAX_DEFAULT_MATMUL_PRECISION=bfloat16 && \
 export LIBTPU_INIT_ARGS='--xla_tpu_dvfs_p_state=7 \
---xla_tpu_enable_latency_hiding_scheduler=true \
 --xla_tpu_spmd_rng_bit_generator_unsafe=true \
 --xla_tpu_enable_dot_strength_reduction=true \
 --xla_tpu_enable_async_collective_fusion_fuse_all_gather=true \
@@ -36,4 +35,4 @@ export LIBTPU_INIT_ARGS='--xla_tpu_dvfs_p_state=7 \
 --xla_tpu_assign_all_reduce_scatter_layout=true' && \
 export HF_HUB_CACHE=/dev/shm/maxdiffusion_hf_cache/ && \
 export HF_HUB_ENABLE_HF_TRANSFER=1 && \
-HF_HUB_CACHE=/dev/shm python wan2p2_t2v_benchmark.py --size 1280*720 --batch_size 1 --dp 2 --bq 6912 --bkv 2560
+HF_HUB_CACHE=/dev/shm python wan2p2_t2v_benchmark.py --size 720*1280 --batch_size 1 --dp 1 --bq 4864 --bkv 1024 --bkv_compute 1024 --bkv_compute_in 1024 --frame_num 81

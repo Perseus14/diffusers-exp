@@ -1,3 +1,10 @@
+import os
+# Crank it up to 3 (FATAL only) to be absolutely sure
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+os.environ['GLOG_minloglevel'] = '3'
+os.environ['XLA_CPP_MIN_LOG_LEVEL'] = '3'
+os.environ['JAX_CPP_MIN_LOG_LEVEL'] = '3'
+
 import argparse
 from datetime import datetime
 import functools
@@ -30,7 +37,6 @@ from torchax.ops import ops_registry
 
 # Local file
 import custom_splash_attention
-
 
 SIZE_CONFIGS = {
     "720*1280": (720, 1280),
@@ -242,7 +248,7 @@ def _tpu_custom_attention(query, key, value, mesh, scale=None):
         vmapped_kernel = jax.vmap(kernel_3d, in_axes=(0, 0, 0), out_axes=0)
         return vmapped_kernel(q, k, v)
 
-    print(f"[DEBUG] {query.shape=}, {key.shape=}")
+    #print(f"[DEBUG] {query.shape=}, {key.shape=}")
     if key.shape[0] > 1:
         dp_mesh_key = "dp"
         remain_mesh_key = ("tp",)
@@ -313,7 +319,7 @@ def _scaled_dot_product_attention(
         res = _tpu_custom_attention(jquery, jkey, jvalue, mesh, scale=scale)
         return env.j2t_iso(res)
 
-    print(f"[DEBUG] use sdpa. {query.shape=}, {key.shape=}")
+    #print(f"[DEBUG] use sdpa. {query.shape=}, {key.shape=}")
     return jtorch._sdpa_reference(
         query, key, value, attn_mask, dropout_p, is_causal, scale, enable_gqa
     )
@@ -467,6 +473,13 @@ def main(args: Args):
 
     with perf_time("load pipe"):
         pipe = WanPipeline.from_pretrained(model_id, torch_dtype=dtype)
+
+        target_shift = 5.0 if "720" in args.size else 3.0
+        
+        pipe.scheduler = pipe.scheduler.__class__.from_config(
+            pipe.scheduler.config, 
+            shift=target_shift
+        )
 
     if args.print_weights:
         print("text_encoder_shardings = ", end="")
