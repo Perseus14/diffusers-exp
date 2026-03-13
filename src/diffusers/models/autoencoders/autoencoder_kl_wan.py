@@ -190,7 +190,7 @@ class WanCausalConv3d(nn.Conv3d):
         if batch_size == 1:
             # Batch=1: Safe to shard width aggressively for speed
             try:
-                x = mark_sharding(x, P(None, None, None, None, ("dp", "tp")))
+                x = mark_sharding(x, P(None, None, None, ("dp", "tp"), None))
                 success = True
             except ValueError:
                 pass
