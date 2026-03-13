@@ -156,3 +156,13 @@ python wan2p2_benchmark.py
 # Benchmark:  94.497410s
 ```
 
+
+
+# Wan-AI/Wan2.2-T2V-A14B-Diffusers Recipe
+
+
+Follow the above instructions and run the following command
+
+```
+source bash.sh
+```
