@@ -161,8 +161,9 @@ python wan2p2_benchmark.py
 # Wan-AI/Wan2.2-T2V-A14B-Diffusers Recipe
 
 
-Follow the above instructions and run the following command
+Run the following command
 
 ```
+source install.sh
 source bash.sh
 ```
