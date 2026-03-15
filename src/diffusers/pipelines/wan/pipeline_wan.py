@@ -588,7 +588,7 @@ class WanPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                     timestep = temp_ts.unsqueeze(0).expand(latents.shape[0], -1)
                 else:
                     timestep = t.expand(latents.shape[0])
-
+                '''
                 with current_model.cache_context("cond"):
                     noise_pred = current_model(
                         hidden_states=latent_model_input,
@@ -607,6 +607,30 @@ class WanPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                             attention_kwargs=attention_kwargs,
                             return_dict=False,
                         )[0]
+                    noise_pred = noise_uncond + current_guidance_scale * (noise_pred - noise_uncond)
+                '''
+                if self.do_classifier_free_guidance:
+                    batch_latent_model_input = torch.cat([latent_model_input, latent_model_input])
+                    batch_timestep = torch.cat([timestep, timestep])
+                    batch_encoder_hidden_states = torch.cat([prompt_embeds, negative_prompt_embeds])
+                else:
+                    batch_latent_model_input = latent_model_input
+                    batch_timestep = timestep
+                    batch_encoder_hidden_states = prompt_embeds
+
+                batch_noise = current_model(
+                    hidden_states=batch_latent_model_input,
+                    timestep=batch_timestep,
+                    encoder_hidden_states=batch_encoder_hidden_states,
+                    attention_kwargs=attention_kwargs,
+                    return_dict=False,
+                )[0]
+
+                noise_pred = batch_noise[0:1]
+                if self.do_classifier_free_guidance:
+                    noise_uncond = batch_noise[1:2]
+                    # Note: Wan's default math is usually Cond + Scale * (Cond - Uncond)
+                    # Make sure this matches whatever was in the original T2V script!
                     noise_pred = noise_uncond + current_guidance_scale * (noise_pred - noise_uncond)
 
                 # compute the previous noisy sample x_t -> x_t-1
