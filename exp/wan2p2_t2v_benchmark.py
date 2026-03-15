@@ -582,7 +582,7 @@ def main(args: Args):
             
             current_datetime = datetime.now().strftime("%Y%m%d_%H%M%S")
             file_name = f"{current_datetime}_batch_0.mp4"
-            export_to_video(video_frames, file_name, fps=16)
+            export_to_video(output, file_name, fps=16)
             print(f"output video done. {file_name}")
 
         if args.profile != "no":
