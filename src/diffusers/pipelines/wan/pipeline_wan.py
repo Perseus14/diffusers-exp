@@ -630,7 +630,7 @@ class WanPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                     noise_pred, noise_uncond = batch_noise.chunk(2)
                     # --- THE GROUND TRUTH DEBUGGER ---
                     # Only print every 10 steps to keep the console clean
-                    if step_index % 10 == 0 or step_index == 0:
+                    if i % 10 == 0 or i == 0:
                         print(f"\n--- TIMESTEP: {t.item()} ---")
                         print(f"v7x Cond   | Max: {noise_pred.max().item():.4f} | Min: {noise_pred.min().item():.4f} | Mean: {noise_pred.mean().item():.4f}")
                         print(f"v7x Uncond | Max: {noise_uncond.max().item():.4f} | Min: {noise_uncond.min().item():.4f} | Mean: {noise_uncond.mean().item():.4f}")
