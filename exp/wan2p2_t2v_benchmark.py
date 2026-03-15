@@ -67,9 +67,9 @@ SUPPORTED_SIZES = {
 }
 
 DEFAULT_PROMPT = "Summer beach vacation style, a white cat wearing sunglasses sits on a surfboard. The fluffy-furred feline gazes directly at the camera with a relaxed expression. Blurred beach scenery forms the background featuring crystal-clear waters, distant green hills, and a blue sky dotted with white clouds. The cat assumes a naturally relaxed posture, as if savoring the sea breeze and warm sunlight. A close-up shot highlights the feline's intricate details and the refreshing atmosphere of the seaside."
-DEFAULT_NEG_PROMPT = "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走"
+#DEFAULT_NEG_PROMPT = "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走"
+DEFAULT_NEG_PROMPT = "Overly vibrant colors, overexposed, static, blurred details, subtitles, style, artwork, painting, picture, still, washed out, worst quality, low quality, JPEG artifacts, ugly, mutilated, extra fingers, poorly drawn hands, poorly drawn face, deformed, disfigured, deformed limbs, fused fingers, motionless scene, cluttered background, three legs, crowded background, walking backwards"
 DEFAULT_PROFILE_OUT_PATH = "/tmp/wan_prof"
-
 
 # fmt: off
 
@@ -232,7 +232,7 @@ def _tpu_custom_attention(query, key, value, mesh, scale=None):
         def kernel_3d(q_3d, k_3d, v_3d):
             q_seq_len = q_3d.shape[1]
             kv_seq_len = k_3d.shape[1]
-
+            num_heads_on_device = q_3d.shape[0]
             block_sizes = splash_attention.BlockSizes(
                 block_q=min(BQSIZE, q_seq_len),
                 block_kv=min(BKVSIZE, kv_seq_len),
@@ -472,14 +472,7 @@ def main(args: Args):
     dtype = torch.bfloat16
 
     with perf_time("load pipe"):
-        pipe = WanPipeline.from_pretrained(model_id, torch_dtype=dtype)
-
-        target_shift = 5.0 if "720" in args.size else 3.0
-        
-        pipe.scheduler = pipe.scheduler.__class__.from_config(
-            pipe.scheduler.config, 
-            shift=target_shift
-        )
+        pipe = WanPipeline.from_pretrained(model_id, torch_dtype=dtype, boundary_ratio=0.875)
 
     if args.print_weights:
         print("text_encoder_shardings = ", end="")
@@ -524,7 +517,6 @@ def main(args: Args):
             pipe.text_encoder.buffers = _shard_weight_dict(
                 pipe.text_encoder.buffers, TEXT_ENCODER_SHARDINGS, mesh
             )
-
         transformer_options = torchax.CompileOptions(
             jax_jit_kwargs={"static_argnames": ("return_dict",)}
         )
@@ -538,22 +530,24 @@ def main(args: Args):
                 pipe.transformer.buffers, TRANSFORMER_SHARDINGS, mesh
             )
 
-        # Retained just in case using a custom dual-stream setup
-        if hasattr(pipe, 'transformer_2'):
-            with perf_time("  Move transformer2"):
-                _move_module(env, pipe.transformer_2)
-                pipe.transformer_2 = torchax.compile(
-                    pipe.transformer_2, transformer_options
-                )
-                pipe.transformer_2.params = _shard_weight_dict(
-                    pipe.transformer_2.params, TRANSFORMER_SHARDINGS, mesh
-                )
-                pipe.transformer_2.buffers = _shard_weight_dict(
-                    pipe.transformer_2.buffers, TRANSFORMER_SHARDINGS, mesh
-                )
+        with perf_time("  Move transformer2"):
+            _move_module(env, pipe.transformer_2)
+            pipe.transformer_2 = torchax.compile(
+                pipe.transformer_2, transformer_options
+            )
+            pipe.transformer_2.params = _shard_weight_dict(
+                pipe.transformer_2.params, TRANSFORMER_SHARDINGS, mesh
+            )
+            pipe.transformer_2.buffers = _shard_weight_dict(
+                pipe.transformer_2.buffers, TRANSFORMER_SHARDINGS, mesh
+            )
 
         with perf_time("  Move vae"):
             _move_module(env, pipe.vae)
+
+            pipe.vae.encoder = torchax.compile(pipe.vae.encoder)
+            pipe.vae.encoder.params = _shard_weight_dict(pipe.vae.encoder.params, VAE_ENCODER_SHARDINGS, mesh)
+            pipe.vae.encoder.buffers = _shard_weight_dict(pipe.vae.encoder.buffers, VAE_ENCODER_SHARDINGS, mesh)
 
             pipe.vae.decoder = torchax.compile(pipe.vae.decoder)
             pipe.vae.decoder.params = _shard_weight_dict(pipe.vae.decoder.params, VAE_DECODER_SHARDINGS, mesh)
@@ -566,31 +560,30 @@ def main(args: Args):
     height = (raw_height // mod_value) * mod_value
     width = (raw_width // mod_value) * mod_value
 
-    prompts = [args.prompt] * args.batch_size
-    negative_prompts = [DEFAULT_NEG_PROMPT] * args.batch_size
+    prompt = args.prompt
+    negative_prompt = DEFAULT_NEG_PROMPT
     generator = torch.Generator().manual_seed(args.base_seed)
     
-    # Text-to-Video uses higher guidance generally (e.g. 5.0) than I2V
-    guidance = 5.0
+    guidance_low = 3
+    guidance_high = 4
     with mesh:
         with perf_time("Warmup and output video"):
-            outputs = pipe(
-                prompt=prompts,
-                negative_prompt=negative_prompts,
+            output = pipe(
+                prompt=prompt,
+                negative_prompt=negative_prompt,
                 height=height,
                 width=width,
                 num_frames=args.frame_num,
-                guidance_scale=guidance,
+                guidance_scale=guidance_high,
+                guidance_scale_2=guidance_low,
                 num_inference_steps=args.sample_steps,
                 generator=generator,
-            ).frames
+            ).frames[0]
             
-            # Since we have a batch, loop through and save each video
-            for i, video_frames in enumerate(outputs):
-                current_datetime = datetime.now().strftime("%Y%m%d_%H%M%S")
-                file_name = f"{current_datetime}_batch_{i}.mp4"
-                export_to_video(video_frames, file_name, fps=16)
-                print(f"output video done. {file_name}")
+            current_datetime = datetime.now().strftime("%Y%m%d_%H%M%S")
+            file_name = f"{current_datetime}_batch_0.mp4"
+            export_to_video(video_frames, file_name, fps=16)
+            print(f"output video done. {file_name}")
 
         if args.profile != "no":
             with perf_time("Profile"):
@@ -600,12 +593,13 @@ def main(args: Args):
                 
                 with jax.profiler.trace(args.profile_output_path):
                     output = pipe(
-                        prompt=prompts,
-                        negative_prompt=negative_prompts,
+                        prompt=prompt,
+                        negative_prompt=negative_prompt,
                         height=height,
                         width=width,
                         num_frames=args.frame_num,
-                        guidance_scale=guidance,
+                        guidance_scale=guidance_high,
+                        guidance_scale_2=guidance_low,
                         num_inference_steps=3,
                         generator=generator,
                         output_type=output_type,
@@ -613,12 +607,13 @@ def main(args: Args):
 
         with perf_time("Benchmark"):
             output = pipe(
-                prompt=prompts,
-                negative_prompt=negative_prompts,
+                prompt=prompt,
+                negative_prompt=negative_prompt,
                 height=height,
                 width=width,
                 num_frames=args.frame_num,
-                guidance_scale=guidance,
+                guidance_scale=guidance_high,
+                guidance_scale_2=guidance_low,
                 num_inference_steps=args.sample_steps,
                 generator=generator,
             ).frames[0]

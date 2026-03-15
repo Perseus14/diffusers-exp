@@ -573,10 +573,12 @@ class WanPipeline(DiffusionPipeline, WanLoraLoaderMixin):
 
                 if boundary_timestep is None or t >= boundary_timestep:
                     # wan2.1 or high-noise stage in wan2.2
+                    print("--------High Noise---------")
                     current_model = self.transformer
                     current_guidance_scale = guidance_scale
                 else:
                     # low-noise stage in wan2.2
+                    print("--------Low Noise---------")
                     current_model = self.transformer_2
                     current_guidance_scale = guidance_scale_2
 
@@ -626,13 +628,21 @@ class WanPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                     return_dict=False,
                 )[0]
 
-                noise_pred = batch_noise[0:1]
                 if self.do_classifier_free_guidance:
-                    noise_uncond = batch_noise[1:2]
-                    # Note: Wan's default math is usually Cond + Scale * (Cond - Uncond)
-                    # Make sure this matches whatever was in the original T2V script!
-                    noise_pred = noise_uncond + current_guidance_scale * (noise_pred - noise_uncond)
-
+                    # Safely split the batch regardless of global size
+                    noise_pred, noise_uncond = batch_noise.chunk(2)
+                    
+                    # Upcast to float32 to prevent precision acid-burn
+                    noise_pred_fp32 = noise_pred.to(torch.float32)
+                    noise_uncond_fp32 = noise_uncond.to(torch.float32)
+                    
+                    # Calculate CFG
+                    noise_pred = noise_uncond_fp32 + current_guidance_scale * (noise_pred_fp32 - noise_uncond_fp32)
+                    
+                    # Cast back to transformer dtype
+                    noise_pred = noise_pred.to(transformer_dtype)
+                else:
+                    noise_pred = batch_noise
                 # compute the previous noisy sample x_t -> x_t-1
                 latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
 
