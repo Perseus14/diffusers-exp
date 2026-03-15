@@ -573,12 +573,10 @@ class WanPipeline(DiffusionPipeline, WanLoraLoaderMixin):
 
                 if boundary_timestep is None or t >= boundary_timestep:
                     # wan2.1 or high-noise stage in wan2.2
-                    print("--------High Noise---------")
                     current_model = self.transformer
                     current_guidance_scale = guidance_scale
                 else:
                     # low-noise stage in wan2.2
-                    print("--------Low Noise---------")
                     current_model = self.transformer_2
                     current_guidance_scale = guidance_scale_2
 
@@ -629,18 +627,15 @@ class WanPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                 )[0]
 
                 if self.do_classifier_free_guidance:
-                    # Safely split the batch regardless of global size
                     noise_pred, noise_uncond = batch_noise.chunk(2)
-                    
-                    # Upcast to float32 to prevent precision acid-burn
-                    noise_pred_fp32 = noise_pred.to(torch.float32)
-                    noise_uncond_fp32 = noise_uncond.to(torch.float32)
-                    
-                    # Calculate CFG
-                    noise_pred = noise_uncond_fp32 + current_guidance_scale * (noise_pred_fp32 - noise_uncond_fp32)
-                    
-                    # Cast back to transformer dtype
-                    noise_pred = noise_pred.to(transformer_dtype)
+                    # --- THE GROUND TRUTH DEBUGGER ---
+                    # Only print every 10 steps to keep the console clean
+                    if step_index % 10 == 0 or step_index == 0:
+                        print(f"\n--- TIMESTEP: {t.item()} ---")
+                        print(f"v7x Cond   | Max: {noise_pred.max().item():.4f} | Min: {noise_pred.min().item():.4f} | Mean: {noise_pred.mean().item():.4f}")
+                        print(f"v7x Uncond | Max: {noise_uncond.max().item():.4f} | Min: {noise_uncond.min().item():.4f} | Mean: {noise_uncond.mean().item():.4f}")
+                    # ----------------------------------
+                    noise_pred = noise_uncond + current_guidance_scale * (noise_pred - noise_uncond)
                 else:
                     noise_pred = batch_noise
                 # compute the previous noisy sample x_t -> x_t-1
