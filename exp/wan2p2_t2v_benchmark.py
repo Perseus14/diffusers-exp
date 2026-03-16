@@ -249,12 +249,14 @@ def _tpu_custom_attention(query, key, value, mesh, scale=None):
         return vmapped_kernel(q, k, v)
 
     #print(f"[DEBUG] {query.shape=}, {key.shape=}")
+    '''
     if key.shape[0] > 1:
         dp_mesh_key = "dp"
         remain_mesh_key = ("tp",)
     else:
-        dp_mesh_key = None
-        remain_mesh_key = ("dp", "tp")
+    '''
+    dp_mesh_key = None
+    remain_mesh_key = ("dp", "tp")
     
     remain_devices_prod = 1
     for d in remain_mesh_key:
