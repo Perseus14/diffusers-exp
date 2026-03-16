@@ -184,21 +184,21 @@ class WanCausalConv3d(nn.Conv3d):
         try:
             x = mark_sharding(x, P(None, None, None, ("dp", "tp"), None))
             success = True
-            print("[DEBUG] Shard conv width along ('dp', 'tp')")
+            #print("[DEBUG] Shard conv width along ('dp', 'tp')")
         except ValueError:
             pass
         if not success:
             try:
                 x = mark_sharding(x, P(None, None, None, ("tp"), None))
                 success = True
-                print("[DEBUG] Shard conv width along ('tp')")
+                #print("[DEBUG] Shard conv width along ('tp')")
             except ValueError:
                 pass
         if not success:
             try:
                 x = mark_sharding(x, P(None, None, None, ("dp"), None))
                 success = True
-                print("[DEBUG] Shard conv width along ('dp')")
+                #print("[DEBUG] Shard conv width along ('dp')")
             except ValueError:
                 pass
         return super().forward(x)
