@@ -588,7 +588,7 @@ class WanPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                     timestep = temp_ts.unsqueeze(0).expand(latents.shape[0], -1)
                 else:
                     timestep = t.expand(latents.shape[0])
-                '''
+                ''' 
                 with current_model.cache_context("cond"):
                     noise_pred = current_model(
                         hidden_states=latent_model_input,
@@ -625,19 +625,13 @@ class WanPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                     attention_kwargs=attention_kwargs,
                     return_dict=False,
                 )[0]
-
+                
                 if self.do_classifier_free_guidance:
                     noise_pred, noise_uncond = batch_noise.chunk(2)
-                    # --- THE GROUND TRUTH DEBUGGER ---
-                    # Only print every 10 steps to keep the console clean
-                    if i % 10 == 0 or i == 0:
-                        print(f"\n--- TIMESTEP: {t.item()} ---")
-                        print(f"v7x Cond   | Max: {noise_pred.max().item():.4f} | Min: {noise_pred.min().item():.4f} | Mean: {noise_pred.mean().item():.4f}")
-                        print(f"v7x Uncond | Max: {noise_uncond.max().item():.4f} | Min: {noise_uncond.min().item():.4f} | Mean: {noise_uncond.mean().item():.4f}")
-                    # ----------------------------------
                     noise_pred = noise_uncond + current_guidance_scale * (noise_pred - noise_uncond)
                 else:
                     noise_pred = batch_noise
+                
                 # compute the previous noisy sample x_t -> x_t-1
                 latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
 
