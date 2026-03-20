@@ -323,12 +323,20 @@ def _scaled_dot_product_attention(
 
 
 # register non-jax type
-def _flatten_model_output(obj):
-    return obj.to_tuple(), type(obj)
-
+def _flatten_model_output(output):
+    return tuple(output.values()), (type(output), tuple(output.keys()))
 
 def _unflatten_model_output(aux, children):
-    return aux(*children)
+    # Dynamically bypass HuggingFace's ModelOutput __post_init__
+    # which tries to iter() over multi-host JAX arrays, causing AssertionError.
+    cls, keys = aux
+    obj = cls.__new__(cls)
+    import collections
+    collections.OrderedDict.__init__(obj)
+    for k, v in zip(keys, children):
+        object.__setattr__(obj, k, v)
+        obj[k] = v
+    return obj
 
 
 jax.tree_util.register_pytree_node(
@@ -530,14 +538,7 @@ def main(args: Args):
                             j_attention_mask = jax.device_put(j_attention_mask, sharding)
                             
                     t_input_ids, t_attention_mask = env.j2t_iso((j_input_ids, j_attention_mask))
-                    out = self.compiled_encoder(t_input_ids, attention_mask=t_attention_mask, **kwargs)
-                    
-                    def _unshard(x):
-                        if hasattr(x, '_elem') and isinstance(x._elem, jax.Array):
-                            return env.j2t_iso(jax.device_put(x._elem, NamedSharding(mesh, P())))
-                        return x
-                        
-                    return jax.tree_util.tree_map(_unshard, out, is_leaf=lambda x: hasattr(x, '_elem'))
+                    return self.compiled_encoder(t_input_ids, attention_mask=t_attention_mask, **kwargs)
 
             pipe.text_encoder = TextEncoderShardingWrapper(compiled_text_encoder)
         transformer_options = torchax.CompileOptions(
