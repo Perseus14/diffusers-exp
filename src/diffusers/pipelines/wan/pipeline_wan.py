@@ -241,16 +241,7 @@ class WanPipeline(DiffusionPipeline, WanLoraLoaderMixin):
         else:
             batch_size = prompt_embeds.shape[0]
 
-        if prompt_embeds is None:
-            prompt_embeds = self._get_t5_prompt_embeds(
-                prompt=prompt,
-                num_videos_per_prompt=num_videos_per_prompt,
-                max_sequence_length=max_sequence_length,
-                device=device,
-                dtype=dtype,
-            )
-
-        if do_classifier_free_guidance and negative_prompt_embeds is None:
+        if prompt_embeds is None and negative_prompt_embeds is None and do_classifier_free_guidance:
             negative_prompt = negative_prompt or ""
             negative_prompt = batch_size * [negative_prompt] if isinstance(negative_prompt, str) else negative_prompt
 
@@ -266,13 +257,49 @@ class WanPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                     " the batch size of `prompt`."
                 )
 
-            negative_prompt_embeds = self._get_t5_prompt_embeds(
-                prompt=negative_prompt,
+            combined_prompt = prompt + negative_prompt
+            combined_prompt_embeds = self._get_t5_prompt_embeds(
+                prompt=combined_prompt,
                 num_videos_per_prompt=num_videos_per_prompt,
                 max_sequence_length=max_sequence_length,
                 device=device,
                 dtype=dtype,
             )
+            prompt_embeds, negative_prompt_embeds = combined_prompt_embeds.chunk(2)
+
+        else:
+            if prompt_embeds is None:
+                prompt_embeds = self._get_t5_prompt_embeds(
+                    prompt=prompt,
+                    num_videos_per_prompt=num_videos_per_prompt,
+                    max_sequence_length=max_sequence_length,
+                    device=device,
+                    dtype=dtype,
+                )
+
+            if do_classifier_free_guidance and negative_prompt_embeds is None:
+                negative_prompt = negative_prompt or ""
+                negative_prompt = batch_size * [negative_prompt] if isinstance(negative_prompt, str) else negative_prompt
+
+                if prompt is not None and type(prompt) is not type(negative_prompt):
+                    raise TypeError(
+                        f"`negative_prompt` should be the same type to `prompt`, but got {type(negative_prompt)} !="
+                        f" {type(prompt)}."
+                    )
+                elif batch_size != len(negative_prompt):
+                    raise ValueError(
+                        f"`negative_prompt`: {negative_prompt} has batch size {len(negative_prompt)}, but `prompt`:"
+                        f" {prompt} has batch size {batch_size}. Please make sure that passed `negative_prompt` matches"
+                        " the batch size of `prompt`."
+                    )
+
+                negative_prompt_embeds = self._get_t5_prompt_embeds(
+                    prompt=negative_prompt,
+                    num_videos_per_prompt=num_videos_per_prompt,
+                    max_sequence_length=max_sequence_length,
+                    device=device,
+                    dtype=dtype,
+                )
 
         return prompt_embeds, negative_prompt_embeds
 
@@ -677,3 +704,4 @@ class WanPipeline(DiffusionPipeline, WanLoraLoaderMixin):
             return (video,)
 
         return WanPipelineOutput(frames=video)
+

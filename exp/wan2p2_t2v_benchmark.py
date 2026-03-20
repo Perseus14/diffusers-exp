@@ -75,17 +75,14 @@ DEFAULT_PROFILE_OUT_PATH = "/tmp/wan_prof"
 
 
 TEXT_ENCODER_SHARDINGS = {
-'shared.weight': (('dp','tp'),), # (torch.Size([256384, 4096]), torch.bfloat16)
-'encoder.block.*.layer.*.SelfAttention.q.weight': (('dp','tp'),), # (torch.Size([4096, 4096]), torch.bfloat16)
-'encoder.block.*.layer.*.SelfAttention.k.weight': (('dp','tp'),), # (torch.Size([4096, 4096]), torch.bfloat16)
-'encoder.block.*.layer.*.SelfAttention.v.weight': (('dp','tp'),), # (torch.Size([4096, 4096]), torch.bfloat16)
-'encoder.block.*.layer.*.SelfAttention.o.weight': (None, ('dp','tp'),), # (torch.Size([4096, 4096]), torch.bfloat16)
-# 'encoder.block.*.layer.*.SelfAttention.relative_attention_bias.weight': (), # (torch.Size([32, 64]), torch.bfloat16)
-# 'encoder.block.*.layer.*.layer_norm.weight': (), # (torch.Size([4096]), torch.bfloat16)
-'encoder.block.*.layer.*.DenseReluDense.wi_0.weight': (('dp','tp'),), # (torch.Size([10240, 4096]), torch.bfloat16)
-'encoder.block.*.layer.*.DenseReluDense.wi_1.weight': (('dp','tp'),), # (torch.Size([10240, 4096]), torch.bfloat16)
-'encoder.block.*.layer.*.DenseReluDense.wo.weight': (None, ('dp','tp'),), # (torch.Size([4096, 10240]), torch.bfloat16)
-# 'encoder.final_layer_norm.weight': (), # (torch.Size([4096]), torch.bfloat16)
+    'shared.weight': ('tp',), 
+    'encoder.block.*.layer.*.SelfAttention.q.weight': ('tp',), 
+    'encoder.block.*.layer.*.SelfAttention.k.weight': ('tp',), 
+    'encoder.block.*.layer.*.SelfAttention.v.weight': ('tp',), 
+    'encoder.block.*.layer.*.SelfAttention.o.weight': (None, 'tp',), 
+    'encoder.block.*.layer.*.DenseReluDense.wi_0.weight': ('tp',), 
+    'encoder.block.*.layer.*.DenseReluDense.wi_1.weight': ('tp',), 
+    'encoder.block.*.layer.*.DenseReluDense.wo.weight': (None, 'tp',), 
 }
 
 TRANSFORMER_SHARDINGS = {
@@ -249,14 +246,12 @@ def _tpu_custom_attention(query, key, value, mesh, scale=None):
         return vmapped_kernel(q, k, v)
 
     #print(f"[DEBUG] {query.shape=}, {key.shape=}")
-    '''
-    if key.shape[0] > 1:
+    if False and key.shape[0] > 1:
         dp_mesh_key = "dp"
         remain_mesh_key = ("tp",)
     else:
-    '''
-    dp_mesh_key = None
-    remain_mesh_key = ("dp", "tp")
+        dp_mesh_key = None
+        remain_mesh_key = ("dp", "tp")
     
     remain_devices_prod = 1
     for d in remain_mesh_key:
@@ -512,37 +507,91 @@ def main(args: Args):
     with perf_time("Move model to tpu"):
         with perf_time("  Move text encoder"):
             _move_module(env, pipe.text_encoder)
-            pipe.text_encoder = torchax.compile(pipe.text_encoder)
-            pipe.text_encoder.params = _shard_weight_dict(
-                pipe.text_encoder.params, TEXT_ENCODER_SHARDINGS, mesh
+            compiled_text_encoder = torchax.compile(pipe.text_encoder)
+            compiled_text_encoder.params = _shard_weight_dict(
+                compiled_text_encoder.params, TEXT_ENCODER_SHARDINGS, mesh
             )
-            pipe.text_encoder.buffers = _shard_weight_dict(
-                pipe.text_encoder.buffers, TEXT_ENCODER_SHARDINGS, mesh
+            compiled_text_encoder.buffers = _shard_weight_dict(
+                compiled_text_encoder.buffers, TEXT_ENCODER_SHARDINGS, mesh
             )
+            
+            class TextEncoderShardingWrapper:
+                def __init__(self, compiled_encoder):
+                    self.compiled_encoder = compiled_encoder
+                    self.dtype = compiled_encoder.dtype
+                    
+                def __call__(self, input_ids, attention_mask=None, **kwargs):
+                    j_input_ids, j_attention_mask = env.t2j_iso((input_ids, attention_mask))
+                    
+                    if j_input_ids.shape[0] > 1 and j_input_ids.shape[0] % dp_dim == 0:
+                        sharding = NamedSharding(mesh, P('dp', None))
+                        j_input_ids = jax.device_put(j_input_ids, sharding)
+                        if j_attention_mask is not None:
+                            j_attention_mask = jax.device_put(j_attention_mask, sharding)
+                            
+                    t_input_ids, t_attention_mask = env.j2t_iso((j_input_ids, j_attention_mask))
+                    return self.compiled_encoder(t_input_ids, attention_mask=t_attention_mask, **kwargs)
+
+            pipe.text_encoder = TextEncoderShardingWrapper(compiled_text_encoder)
         transformer_options = torchax.CompileOptions(
             jax_jit_kwargs={"static_argnames": ("return_dict",)}
         )
+        
+        class TransformerShardingWrapper:
+            def __init__(self, compiled_transformer):
+                self.compiled_transformer = compiled_transformer
+                self.dtype = compiled_transformer.dtype
+                self.config = compiled_transformer.config
+                
+            def __call__(self, **kwargs):
+                hidden_states = kwargs.get('hidden_states')
+                timestep = kwargs.get('timestep')
+                encoder_hidden_states = kwargs.get('encoder_hidden_states')
+                
+                j_hidden_states, j_timestep, j_encoder_hidden_states = env.t2j_iso((hidden_states, timestep, encoder_hidden_states))
+                
+                if j_hidden_states is not None and j_hidden_states.shape[0] > 1 and j_hidden_states.shape[0] % dp_dim == 0:
+                    sharding = NamedSharding(mesh, P('dp', *([None] * (j_hidden_states.ndim - 1))))
+                    j_hidden_states = jax.device_put(j_hidden_states, sharding)
+                    
+                    sharding_ts = NamedSharding(mesh, P('dp', *([None] * (j_timestep.ndim - 1))))
+                    j_timestep = jax.device_put(j_timestep, sharding_ts)
+                    
+                    sharding_enc = NamedSharding(mesh, P('dp', *([None] * (j_encoder_hidden_states.ndim - 1))))
+                    j_encoder_hidden_states = jax.device_put(j_encoder_hidden_states, sharding_enc)
+                        
+                t_hidden_states, t_timestep, t_encoder_hidden_states = env.j2t_iso((j_hidden_states, j_timestep, j_encoder_hidden_states))
+                
+                new_kwargs = kwargs.copy()
+                if hidden_states is not None: new_kwargs['hidden_states'] = t_hidden_states
+                if timestep is not None: new_kwargs['timestep'] = t_timestep
+                if encoder_hidden_states is not None: new_kwargs['encoder_hidden_states'] = t_encoder_hidden_states
+                
+                return self.compiled_transformer(**new_kwargs)
+
         with perf_time("  Move transformer"):
             _move_module(env, pipe.transformer)
-            pipe.transformer = torchax.compile(pipe.transformer, transformer_options)
-            pipe.transformer.params = _shard_weight_dict(
-                pipe.transformer.params, TRANSFORMER_SHARDINGS, mesh
+            compiled_transformer = torchax.compile(pipe.transformer, transformer_options)
+            compiled_transformer.params = _shard_weight_dict(
+                compiled_transformer.params, TRANSFORMER_SHARDINGS, mesh
             )
-            pipe.transformer.buffers = _shard_weight_dict(
-                pipe.transformer.buffers, TRANSFORMER_SHARDINGS, mesh
+            compiled_transformer.buffers = _shard_weight_dict(
+                compiled_transformer.buffers, TRANSFORMER_SHARDINGS, mesh
             )
+            pipe.transformer = TransformerShardingWrapper(compiled_transformer)
 
         with perf_time("  Move transformer2"):
             _move_module(env, pipe.transformer_2)
-            pipe.transformer_2 = torchax.compile(
+            compiled_transformer_2 = torchax.compile(
                 pipe.transformer_2, transformer_options
             )
-            pipe.transformer_2.params = _shard_weight_dict(
-                pipe.transformer_2.params, TRANSFORMER_SHARDINGS, mesh
+            compiled_transformer_2.params = _shard_weight_dict(
+                compiled_transformer_2.params, TRANSFORMER_SHARDINGS, mesh
             )
-            pipe.transformer_2.buffers = _shard_weight_dict(
-                pipe.transformer_2.buffers, TRANSFORMER_SHARDINGS, mesh
+            compiled_transformer_2.buffers = _shard_weight_dict(
+                compiled_transformer_2.buffers, TRANSFORMER_SHARDINGS, mesh
             )
+            pipe.transformer_2 = TransformerShardingWrapper(compiled_transformer_2)
 
         with perf_time("  Move vae"):
             _move_module(env, pipe.vae)
@@ -626,3 +675,4 @@ if __name__ == "__main__":
     args = parse_args()
     print(args)
     main(args)
+
