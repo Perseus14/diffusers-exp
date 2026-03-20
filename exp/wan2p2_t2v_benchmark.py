@@ -530,7 +530,14 @@ def main(args: Args):
                             j_attention_mask = jax.device_put(j_attention_mask, sharding)
                             
                     t_input_ids, t_attention_mask = env.j2t_iso((j_input_ids, j_attention_mask))
-                    return self.compiled_encoder(t_input_ids, attention_mask=t_attention_mask, **kwargs)
+                    out = self.compiled_encoder(t_input_ids, attention_mask=t_attention_mask, **kwargs)
+                    
+                    def _unshard(x):
+                        if hasattr(x, '_elem') and isinstance(x._elem, jax.Array):
+                            return env.j2t_iso(jax.device_put(x._elem, NamedSharding(mesh, P())))
+                        return x
+                        
+                    return jax.tree_util.tree_map(_unshard, out, is_leaf=lambda x: hasattr(x, '_elem'))
 
             pipe.text_encoder = TextEncoderShardingWrapper(compiled_text_encoder)
         transformer_options = torchax.CompileOptions(
