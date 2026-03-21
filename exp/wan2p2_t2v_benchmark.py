@@ -22,7 +22,6 @@ from jax.experimental.pallas.ops.tpu import splash_attention
 
 import torch
 import numpy as np
-# Changed from WanImageToVideoPipeline to WanPipeline
 from diffusers import WanPipeline
 from diffusers.utils import export_to_video
 from diffusers.models.autoencoders import vae as diffusers_vae
@@ -43,10 +42,6 @@ SIZE_CONFIGS = {
     "1280*720": (1280, 720),
     "480*832": (480, 832),
     "832*480": (832, 480),
-    # '704*1280': (704, 1280),
-    # '1280*704': (1280, 704),
-    # '1024*704': (1024, 704),
-    # '704*1024': (704, 1024),
 }
 
 SUPPORTED_SIZES = {
@@ -67,13 +62,10 @@ SUPPORTED_SIZES = {
 }
 
 DEFAULT_PROMPT = "Summer beach vacation style, a white cat wearing sunglasses sits on a surfboard. The fluffy-furred feline gazes directly at the camera with a relaxed expression. Blurred beach scenery forms the background featuring crystal-clear waters, distant green hills, and a blue sky dotted with white clouds. The cat assumes a naturally relaxed posture, as if savoring the sea breeze and warm sunlight. A close-up shot highlights the feline's intricate details and the refreshing atmosphere of the seaside."
-#DEFAULT_NEG_PROMPT = "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走"
 DEFAULT_NEG_PROMPT = "Overly vibrant colors, overexposed, static, blurred details, subtitles, style, artwork, painting, picture, still, washed out, worst quality, low quality, JPEG artifacts, ugly, mutilated, extra fingers, poorly drawn hands, poorly drawn face, deformed, disfigured, deformed limbs, fused fingers, motionless scene, cluttered background, three legs, crowded background, walking backwards"
 DEFAULT_PROFILE_OUT_PATH = "/tmp/wan_prof"
 
 # fmt: off
-
-
 TEXT_ENCODER_SHARDINGS = {
     'shared.weight': ('tp',), 
     'encoder.block.*.layer.*.SelfAttention.q.weight': ('tp',), 
@@ -85,51 +77,31 @@ TEXT_ENCODER_SHARDINGS = {
     'encoder.block.*.layer.*.DenseReluDense.wo.weight': (None, 'tp',), 
 }
 
+# Added 'transformer.' prefix to all keys since the model is now wrapped in WanCFGWrapper
 TRANSFORMER_SHARDINGS = {
-# 'scale_shift_table': (), # (torch.Size([1, 2, 5120]), torch.float32)
-# 'patch_embedding.weight': (), # (torch.Size([5120, 36, 1, 2, 2]), torch.bfloat16)
-# 'patch_embedding.bias': (), # (torch.Size([5120]), torch.bfloat16)
-'condition_embedder.time_embedder.linear_1.weight': ('tp',), # (torch.Size([5120, 256]), torch.float32)
-'condition_embedder.time_embedder.linear_1.bias': ('tp',), # (torch.Size([5120]), torch.float32)
-'condition_embedder.time_embedder.linear_2.weight': (None, 'tp',), # (torch.Size([5120, 5120]), torch.float32)
-# 'condition_embedder.time_embedder.linear_2.bias': (), # (torch.Size([5120]), torch.float32)
-# 'condition_embedder.time_proj.weight': (), # (torch.Size([30720, 5120]), torch.bfloat16)
-# 'condition_embedder.time_proj.bias': (), # (torch.Size([30720]), torch.bfloat16)
-'condition_embedder.text_embedder.linear_1.weight': ('tp',), # (torch.Size([5120, 4096]), torch.bfloat16)
-'condition_embedder.text_embedder.linear_1.bias': ('tp',), # (torch.Size([5120]), torch.bfloat16)
-'condition_embedder.text_embedder.linear_2.weight': (None, 'tp',), # (torch.Size([5120, 5120]), torch.bfloat16)
-# 'condition_embedder.text_embedder.linear_2.bias': (), # (torch.Size([5120]), torch.bfloat16)
-# 'blocks.*.scale_shift_table': (), # (torch.Size([1, 6, 5120]), torch.float32)
-'blocks.*.attn1.to_q.weight': ('tp',), # (torch.Size([5120, 5120]), torch.bfloat16)
-'blocks.*.attn1.to_q.bias': ('tp',), # (torch.Size([5120]), torch.bfloat16)
-'blocks.*.attn1.to_k.weight': ('tp',), # (torch.Size([5120, 5120]), torch.bfloat16)
-'blocks.*.attn1.to_k.bias': ('tp',), # (torch.Size([5120]), torch.bfloat16)
-'blocks.*.attn1.to_v.weight': ('tp',), # (torch.Size([5120, 5120]), torch.bfloat16)
-'blocks.*.attn1.to_v.bias': ('tp',), # (torch.Size([5120]), torch.bfloat16)
-'blocks.*.attn1.to_out.*.weight': (None, 'tp',), # (torch.Size([5120, 5120]), torch.bfloat16)
-# 'blocks.*.attn1.to_out.*.bias': (), # (torch.Size([5120]), torch.bfloat16)
-# 'blocks.*.attn1.norm_q.weight': (), # (torch.Size([5120]), torch.bfloat16)
-# 'blocks.*.attn1.norm_k.weight': (), # (torch.Size([5120]), torch.bfloat16)
-'blocks.*.attn2.to_q.weight': ('tp',), # (torch.Size([5120, 5120]), torch.bfloat16)
-'blocks.*.attn2.to_q.bias': ('tp',), # (torch.Size([5120]), torch.bfloat16)
-'blocks.*.attn2.to_k.weight': ('tp',), # (torch.Size([5120, 5120]), torch.bfloat16)
-'blocks.*.attn2.to_k.bias': ('tp',), # (torch.Size([5120]), torch.bfloat16)
-'blocks.*.attn2.to_v.weight': ('tp',), # (torch.Size([5120, 5120]), torch.bfloat16)
-'blocks.*.attn2.to_v.bias': ('tp',), # (torch.Size([5120]), torch.bfloat16)
-'blocks.*.attn2.to_out.*.weight': (None, 'tp',), # (torch.Size([5120, 5120]), torch.bfloat16)
-# 'blocks.*.attn2.to_out.*.bias': (), # (torch.Size([5120]), torch.bfloat16)
-# 'blocks.*.attn2.norm_q.weight': (), # (torch.Size([5120]), torch.bfloat16)
-# 'blocks.*.attn2.norm_k.weight': (), # (torch.Size([5120]), torch.bfloat16)
-# 'blocks.*.norm2.weight': (), # (torch.Size([5120]), torch.float32)
-# 'blocks.*.norm2.bias': (), # (torch.Size([5120]), torch.float32)
-'blocks.*.ffn.net.*.proj.weight': ('tp',), # (torch.Size([13824, 5120]), torch.bfloat16)
-'blocks.*.ffn.net.*.proj.bias': ('tp',), # (torch.Size([13824]), torch.bfloat16)
-'blocks.*.ffn.net.*.weight': (None, 'tp',), # (torch.Size([5120, 13824]), torch.bfloat16)
-# 'blocks.*.ffn.net.*.bias': (), # (torch.Size([5120]), torch.bfloat16)
-# 'proj_out.weight': (), # (torch.Size([64, 5120]), torch.bfloat16)
-# 'proj_out.bias': (), # (torch.Size([64]), torch.bfloat16)
-# 'rope.freqs_cos': (), # (torch.Size([1024, 128]), torch.float32)
-# 'rope.freqs_sin': (), # (torch.Size([1024, 128]), torch.float32)
+    'transformer.condition_embedder.time_embedder.linear_1.weight': ('tp',),
+    'transformer.condition_embedder.time_embedder.linear_1.bias': ('tp',),
+    'transformer.condition_embedder.time_embedder.linear_2.weight': (None, 'tp',),
+    'transformer.condition_embedder.text_embedder.linear_1.weight': ('tp',),
+    'transformer.condition_embedder.text_embedder.linear_1.bias': ('tp',),
+    'transformer.condition_embedder.text_embedder.linear_2.weight': (None, 'tp',),
+    'transformer.blocks.*.attn1.to_q.weight': ('tp',),
+    'transformer.blocks.*.attn1.to_q.bias': ('tp',),
+    'transformer.blocks.*.attn1.to_k.weight': ('tp',),
+    'transformer.blocks.*.attn1.to_k.bias': ('tp',),
+    'transformer.blocks.*.attn1.to_v.weight': ('tp',),
+    'transformer.blocks.*.attn1.to_v.bias': ('tp',),
+    'transformer.blocks.*.attn1.to_out.*.weight': (None, 'tp',), # Kept .* because it is a ModuleList with Identity
+    'transformer.blocks.*.attn2.to_q.weight': ('tp',),
+    'transformer.blocks.*.attn2.to_q.bias': ('tp',),
+    'transformer.blocks.*.attn2.to_k.weight': ('tp',),
+    'transformer.blocks.*.attn2.to_k.bias': ('tp',),
+    'transformer.blocks.*.attn2.to_v.weight': ('tp',),
+    'transformer.blocks.*.attn2.to_v.bias': ('tp',),
+    'transformer.blocks.*.attn2.to_out.*.weight': (None, 'tp',), # Kept .* because it is a ModuleList with Identity
+    'transformer.blocks.*.ffn.net.*.proj.weight': ('tp',),
+    'transformer.blocks.*.ffn.net.*.proj.bias': ('tp',),
+    'transformer.blocks.*.ffn.net.*.weight': (None, 'tp',),
 }
 
 VAE_ENCODER_SHARDINGS = {}
@@ -140,7 +112,6 @@ BQSIZE = 3328
 BKVSIZE = 2816
 BKVCOMPUTESIZE = 256
 BKVCOMPUTEINSIZE = 256
-
 
 @contextmanager
 def perf_time(name: str):
@@ -209,7 +180,6 @@ def _move_module(env, module):
 
 
 ### Flash Attention
-
 def pad_to_multiple(x, multiple, axis):
     seq_len = x.shape[axis]
     pad_len = (multiple - seq_len % multiple) % multiple
@@ -245,7 +215,6 @@ def _tpu_custom_attention(query, key, value, mesh, scale=None):
         vmapped_kernel = jax.vmap(kernel_3d, in_axes=(0, 0, 0), out_axes=0)
         return vmapped_kernel(q, k, v)
 
-    #print(f"[DEBUG] {query.shape=}, {key.shape=}")
     if False and key.shape[0] > 1:
         dp_mesh_key = "dp"
         remain_mesh_key = ("tp",)
@@ -316,7 +285,6 @@ def _scaled_dot_product_attention(
         res = _tpu_custom_attention(jquery, jkey, jvalue, mesh, scale=scale)
         return env.j2t_iso(res)
 
-    #print(f"[DEBUG] use sdpa. {query.shape=}, {key.shape=}")
     return jtorch._sdpa_reference(
         query, key, value, attn_mask, dropout_p, is_causal, scale, enable_gqa
     )
@@ -327,8 +295,6 @@ def _flatten_model_output(output):
     return tuple(output.values()), (type(output), tuple(output.keys()))
 
 def _unflatten_model_output(aux, children):
-    # Dynamically bypass HuggingFace's ModelOutput __post_init__
-    # which tries to iter() over multi-host JAX arrays, causing AssertionError.
     cls, keys = aux
     obj = cls.__new__(cls)
     import collections
@@ -337,7 +303,6 @@ def _unflatten_model_output(aux, children):
         object.__setattr__(obj, k, v)
         obj[k] = v
     return obj
-
 
 jax.tree_util.register_pytree_node(
     modeling_outputs.BaseModelOutputWithPastAndCrossAttentions,
@@ -463,6 +428,71 @@ def parse_args():
 
     return parser.parse_args(namespace=Args())
 
+from diffusers.models.autoencoders.autoencoder_kl_wan import WanCausalConv3d
+
+class WanVAEDecodeWrapper(torch.nn.Module):
+    def __init__(self, vae):
+        super().__init__()
+        # Nest the necessary modules so torchax can trace them
+        self.decoder = vae.decoder
+        self.post_quant_conv = vae.post_quant_conv
+        self.patch_size = vae.config.patch_size
+        
+        # Pre-count the causal convs to initialize the correct cache size
+        self.conv_num = sum(isinstance(m, WanCausalConv3d) for m in self.decoder.modules())
+
+    def forward(self, z):
+        x = self.post_quant_conv(z)
+        feat_map = [None] * self.conv_num
+        
+        # CHUNK 1: Prime the cache inside the XLA graph
+        out_0, feat_map = self.decoder(
+            x[:, :, 0:1, :, :], 
+            feat_cache=feat_map, 
+            first_chunk=True
+        )
+        
+        # CHUNK 2: Process the rest (uses the cache directly from TPU memory!)
+        out_rest, _ = self.decoder(
+            x[:, :, 1:, :, :], 
+            feat_cache=feat_map, 
+            first_chunk=False
+        )
+        
+        out = torch.cat([out_0, out_rest], dim=2)
+        
+        # Unpatchify directly in the compiled graph
+        if self.patch_size is not None:
+            patch_size = self.patch_size
+            batch_size, c_patches, frames, height, width = out.shape
+            channels = c_patches // (patch_size * patch_size)
+            out = out.view(batch_size, channels, patch_size, patch_size, frames, height, width)
+            out = out.permute(0, 1, 4, 5, 3, 6, 2).contiguous()
+            out = out.view(batch_size, channels, frames, height * patch_size, width * patch_size)
+
+        return torch.clamp(out, min=-1.0, max=1.0)
+
+class WanCFGWrapper(torch.nn.Module):
+    def __init__(self, model):
+        super().__init__()
+        self.transformer = model
+        self.config = model.config
+        self.dtype = model.dtype
+
+    def forward(self, hidden_states, timestep, encoder_hidden_states, guidance_scale, **kwargs):
+        # Run the batch=2 forward pass
+        batch_noise = self.transformer(
+            hidden_states=hidden_states,
+            timestep=timestep,
+            encoder_hidden_states=encoder_hidden_states,
+            return_dict=False,
+            **kwargs
+        )[0]
+        
+        # XLA fuses this math directly into the TPU graph!
+        noise_pred, noise_uncond = batch_noise.chunk(2)
+        return noise_uncond + guidance_scale * (noise_pred - noise_uncond)
+
 
 def main(args: Args):
     global BQSIZE, BKVSIZE, BKVCOMPUTESIZE, BKVCOMPUTEINSIZE
@@ -472,7 +502,6 @@ def main(args: Args):
     BKVCOMPUTEINSIZE = args.bkv_compute_in
     torch.set_default_dtype(torch.bfloat16)
 
-    # Changed from I2V model to standard T2V model
     model_id = "Wan-AI/Wan2.2-T2V-A14B-Diffusers" 
     dtype = torch.bfloat16
 
@@ -541,6 +570,7 @@ def main(args: Args):
                     return self.compiled_encoder(t_input_ids, attention_mask=t_attention_mask, **kwargs)
 
             pipe.text_encoder = TextEncoderShardingWrapper(compiled_text_encoder)
+            
         transformer_options = torchax.CompileOptions(
             jax_jit_kwargs={"static_argnames": ("return_dict",)}
         )
@@ -571,15 +601,25 @@ def main(args: Args):
                 t_hidden_states, t_timestep, t_encoder_hidden_states = env.j2t_iso((j_hidden_states, j_timestep, j_encoder_hidden_states))
                 
                 new_kwargs = kwargs.copy()
+                guidance_scale = new_kwargs.pop('guidance_scale', 5.0) 
+                
                 if hidden_states is not None: new_kwargs['hidden_states'] = t_hidden_states
                 if timestep is not None: new_kwargs['timestep'] = t_timestep
                 if encoder_hidden_states is not None: new_kwargs['encoder_hidden_states'] = t_encoder_hidden_states
                 
+                new_kwargs['guidance_scale'] = float(guidance_scale)
+                
                 return self.compiled_transformer(**new_kwargs)
 
         with perf_time("  Move transformer"):
-            _move_module(env, pipe.transformer)
-            compiled_transformer = torchax.compile(pipe.transformer, transformer_options)
+            # Strip Dropout for Identity to clean the XLA graph
+            for block in pipe.transformer.blocks:
+                block.attn1.to_out[1] = torch.nn.Identity()
+                block.attn2.to_out[1] = torch.nn.Identity()
+
+            wrapped_transformer = WanCFGWrapper(pipe.transformer)
+            _move_module(env, wrapped_transformer)
+            compiled_transformer = torchax.compile(wrapped_transformer, transformer_options)
             compiled_transformer.params = _shard_weight_dict(
                 compiled_transformer.params, TRANSFORMER_SHARDINGS, mesh
             )
@@ -589,30 +629,48 @@ def main(args: Args):
             pipe.transformer = TransformerShardingWrapper(compiled_transformer)
 
         with perf_time("  Move transformer2"):
-            _move_module(env, pipe.transformer_2)
-            compiled_transformer_2 = torchax.compile(
-                pipe.transformer_2, transformer_options
-            )
-            compiled_transformer_2.params = _shard_weight_dict(
-                compiled_transformer_2.params, TRANSFORMER_SHARDINGS, mesh
-            )
-            compiled_transformer_2.buffers = _shard_weight_dict(
-                compiled_transformer_2.buffers, TRANSFORMER_SHARDINGS, mesh
-            )
-            pipe.transformer_2 = TransformerShardingWrapper(compiled_transformer_2)
+            if getattr(pipe, "transformer_2", None) is not None:
+                # Strip Dropout for Identity
+                for block in pipe.transformer_2.blocks:
+                    block.attn1.to_out[1] = torch.nn.Identity()
+                    block.attn2.to_out[1] = torch.nn.Identity()
+
+                wrapped_transformer_2 = WanCFGWrapper(pipe.transformer_2)
+                _move_module(env, wrapped_transformer_2)
+                compiled_transformer_2 = torchax.compile(
+                    wrapped_transformer_2, transformer_options
+                )
+                compiled_transformer_2.params = _shard_weight_dict(
+                    compiled_transformer_2.params, TRANSFORMER_SHARDINGS, mesh
+                )
+                compiled_transformer_2.buffers = _shard_weight_dict(
+                    compiled_transformer_2.buffers, TRANSFORMER_SHARDINGS, mesh
+                )
+                pipe.transformer_2 = TransformerShardingWrapper(compiled_transformer_2)
 
         with perf_time("  Move vae"):
             _move_module(env, pipe.vae)
 
-            pipe.vae.encoder = torchax.compile(pipe.vae.encoder)
-            pipe.vae.encoder.params = _shard_weight_dict(pipe.vae.encoder.params, VAE_ENCODER_SHARDINGS, mesh)
-            pipe.vae.encoder.buffers = _shard_weight_dict(pipe.vae.encoder.buffers, VAE_ENCODER_SHARDINGS, mesh)
+            # 1. Wrap the VAE decoder logic
+            wrapped_vae_decoder = WanVAEDecodeWrapper(pipe.vae)
+            
+            # 2. Compile the whole chunking process as one XLA graph
+            compiled_vae_decoder = torchax.compile(wrapped_vae_decoder)
+            
+            # 3. Shard as normal (Defaults to P() since VAE_DECODER_SHARDINGS is empty)
+            compiled_vae_decoder.params = _shard_weight_dict(compiled_vae_decoder.params, VAE_DECODER_SHARDINGS, mesh)
+            compiled_vae_decoder.buffers = _shard_weight_dict(compiled_vae_decoder.buffers, VAE_DECODER_SHARDINGS, mesh)
+            
+            # 4. Override the pipeline's decode method to use our compiled graph directly!
+            from diffusers.models.autoencoders.vae import DecoderOutput
+            def custom_vae_decode(z, return_dict=False):
+                out = compiled_vae_decoder(z)
+                if not return_dict:
+                    return (out,)
+                return DecoderOutput(sample=out)
+                
+            pipe.vae.decode = custom_vae_decode
 
-            pipe.vae.decoder = torchax.compile(pipe.vae.decoder)
-            pipe.vae.decoder.params = _shard_weight_dict(pipe.vae.decoder.params, VAE_DECODER_SHARDINGS, mesh)
-            pipe.vae.decoder.buffers = _shard_weight_dict(pipe.vae.decoder.buffers, VAE_DECODER_SHARDINGS, mesh)
-
-    # Directly map args.size to width and height without ratio calculation (standard T2V sizes)
     raw_width, raw_height = SIZE_CONFIGS[args.size]
     
     mod_value = pipe.vae_scale_factor_spatial * pipe.transformer.config.patch_size[1]
@@ -646,8 +704,6 @@ def main(args: Args):
 
         if args.profile != "no":
             with perf_time("Profile"):
-                # If profiling just the DiT (Transformer), stop at latents.
-                # If profiling 'all', let it run through the VAE to numpy/pil.
                 output_type = "latent" if args.profile == "dit" else "np"
                 
                 with jax.profiler.trace(args.profile_output_path):
@@ -683,4 +739,3 @@ if __name__ == "__main__":
     args = parse_args()
     print(args)
     main(args)
-

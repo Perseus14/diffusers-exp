@@ -644,21 +644,15 @@ class WanPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                     batch_latent_model_input = latent_model_input
                     batch_timestep = timestep
                     batch_encoder_hidden_states = prompt_embeds
-
-                batch_noise = current_model(
+                
+                noise_pred = current_model(
                     hidden_states=batch_latent_model_input,
                     timestep=batch_timestep,
                     encoder_hidden_states=batch_encoder_hidden_states,
+                    guidance_scale=current_guidance_scale, # <--- Pass the scalar down
                     attention_kwargs=attention_kwargs,
-                    return_dict=False,
-                )[0]
-                
-                if self.do_classifier_free_guidance:
-                    noise_pred, noise_uncond = batch_noise.chunk(2)
-                    noise_pred = noise_uncond + current_guidance_scale * (noise_pred - noise_uncond)
-                else:
-                    noise_pred = batch_noise
-                
+                )
+
                 # compute the previous noisy sample x_t -> x_t-1
                 latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
 

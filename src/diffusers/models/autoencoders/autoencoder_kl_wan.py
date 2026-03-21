@@ -1244,12 +1244,21 @@ class AutoencoderKLWan(ModelMixin, ConfigMixin, FromOriginalModelMixin):
 
         self.clear_cache()
         x = self.post_quant_conv(z)
+        for i in range(num_frame):
+            if i == 0:
+                out, self._feat_map = self.decoder(
+                    x[:, :, i : i + 1, :, :],
+                    feat_cache=self._feat_map,
+                    first_chunk=True,
+                )
+            else:
+                out_, self._feat_map = self.decoder(x[:, :, i : i + 1, :, :], feat_cache=self._feat_map)
+                out = torch.cat([out, out_], 2)
+            # Prevent jit optmization run multi-step loops simultaneous and cause OOM.
+            # Add the dependency next x to current out
+            # x, out = jax.lax.optimization_barrier(interop.jax_view((x, out)))
+            # x, out = interop.torch_view((x, out))
         
-        out, self._feat_map = self.decoder(
-            x, 
-            feat_cache=self._feat_map, 
-            first_chunk=True
-        )
 
         if self.config.patch_size is not None:
             out = unpatchify(out, patch_size=self.config.patch_size)
