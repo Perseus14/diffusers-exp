@@ -494,6 +494,16 @@ class WanCFGWrapper(torch.nn.Module):
         noise_pred, noise_uncond = batch_noise.chunk(2)
         return noise_uncond + guidance_scale * (noise_pred - noise_uncond)
 
+class WanSchedulerStepWrapper(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, sample, noise_pred, sigma, sigma_next):
+        # Pure Flow Matching / Euler discrete step math
+        # XLA will fuse this into a single lightning-fast operation
+        dt = sigma_next - sigma
+        prev_sample = sample + noise_pred * dt
+        return prev_sample
 
 def main(args: Args):
     global BQSIZE, BKVSIZE, BKVCOMPUTESIZE, BKVCOMPUTEINSIZE
@@ -648,6 +658,47 @@ def main(args: Args):
                     compiled_transformer_2.buffers, TRANSFORMER_SHARDINGS, mesh
                 )
                 pipe.transformer_2 = TransformerShardingWrapper(compiled_transformer_2)
+
+        with perf_time("  Move scheduler"):
+            # 1. Instantiate our new wrapper
+            wrapped_scheduler = WanSchedulerStepWrapper()
+            _move_module(env, wrapped_scheduler)
+            
+            # 2. Compile it
+            compiled_scheduler = torchax.compile(wrapped_scheduler)
+            
+            # 3. Handle empty parameter dictionaries for the compiler API
+            compiled_scheduler.params = _shard_weight_dict(compiled_scheduler.params, {}, mesh)
+            compiled_scheduler.buffers = _shard_weight_dict(compiled_scheduler.buffers, {}, mesh)
+            
+            # 4. Create the Sharding Wrapper to manage the XLA boundary
+            class SchedulerShardingWrapper:
+                def __init__(self, compiled_sched):
+                    self.compiled_sched = compiled_sched
+                    
+                def __call__(self, sample, noise_pred, sigma, sigma_next):
+                    # Convert the float sigmas to tensors so XLA doesn't recompile on every step
+                    t_sigma = torch.tensor(sigma, dtype=sample.dtype)
+                    t_sigma_next = torch.tensor(sigma_next, dtype=sample.dtype)
+                    
+                    j_sample, j_noise_pred, j_sigma, j_sigma_next = env.t2j_iso(
+                        (sample, noise_pred, t_sigma, t_sigma_next)
+                    )
+                    
+                    # Enforce Data Parallelism on the massive latents
+                    if j_sample.shape[0] > 1 and j_sample.shape[0] % dp_dim == 0:
+                        sharding = NamedSharding(mesh, P('dp', *([None] * (j_sample.ndim - 1))))
+                        j_sample = jax.device_put(j_sample, sharding)
+                        j_noise_pred = jax.device_put(j_noise_pred, sharding)
+                        
+                    t_sample, t_noise_pred, t_sigma, t_sigma_next = env.j2t_iso(
+                        (j_sample, j_noise_pred, j_sigma, j_sigma_next)
+                    )
+                    
+                    return self.compiled_sched(t_sample, t_noise_pred, t_sigma, t_sigma_next)
+                    
+            # Attach it directly to the pipeline object
+            pipe.compiled_scheduler_step = SchedulerShardingWrapper(compiled_scheduler)
 
         with perf_time("  Move vae"):
             _move_module(env, pipe.vae)

@@ -654,7 +654,24 @@ class WanPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                 )
 
                 # compute the previous noisy sample x_t -> x_t-1
-                latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+                #latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+
+                # compute the previous noisy sample x_t -> x_t-1
+                if hasattr(self, "compiled_scheduler_step"):
+                    # Grab the scalar step sizes directly from the HF scheduler
+                    sigma = self.scheduler.sigmas[i]
+                    sigma_next = self.scheduler.sigmas[i + 1]
+
+                    # Fire the compiled XLA math!
+                    latents = self.compiled_scheduler_step(
+                        sample=latents,
+                        noise_pred=noise_pred,
+                        sigma=sigma,
+                        sigma_next=sigma_next
+                    )
+                else:
+                    # Fallback to standard eager HF step if not compiled
+                    latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
 
                 if callback_on_step_end is not None:
                     callback_kwargs = {}
