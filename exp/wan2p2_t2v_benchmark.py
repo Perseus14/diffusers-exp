@@ -25,6 +25,7 @@ import numpy as np
 from diffusers import WanPipeline
 from diffusers.utils import export_to_video
 from diffusers.models.autoencoders import vae as diffusers_vae
+from diffusers.models.autoencoders.vae import DecoderOutput
 from diffusers.models import modeling_outputs as diffusers_modeling_outputs
 
 from transformers import modeling_outputs
@@ -662,7 +663,6 @@ def main(args: Args):
             compiled_vae_decoder.buffers = _shard_weight_dict(compiled_vae_decoder.buffers, VAE_DECODER_SHARDINGS, mesh)
             
             # 4. Override the pipeline's decode method to use our compiled graph directly!
-            from diffusers.models.autoencoders.vae import DecoderOutput
             def custom_vae_decode(z, return_dict=False):
                 out = compiled_vae_decoder(z)
                 if not return_dict:
@@ -695,6 +695,7 @@ def main(args: Args):
                 guidance_scale_2=guidance_low,
                 num_inference_steps=args.sample_steps,
                 generator=generator,
+                max_sequence_length=256,
             ).frames[0]
             
             current_datetime = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -717,6 +718,7 @@ def main(args: Args):
                         guidance_scale_2=guidance_low,
                         num_inference_steps=3,
                         generator=generator,
+                        max_sequence_length=256,
                         output_type=output_type,
                     ).frames[0]
 
@@ -731,6 +733,7 @@ def main(args: Args):
                 guidance_scale_2=guidance_low,
                 num_inference_steps=args.sample_steps,
                 generator=generator,
+                max_sequence_length=256,
             ).frames[0]
 
     print("Done")
