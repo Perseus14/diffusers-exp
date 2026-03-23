@@ -332,7 +332,6 @@ class WanTimeTextImageEmbedding(nn.Module):
         encoder_hidden_states: torch.Tensor,
         encoder_hidden_states_image: Optional[torch.Tensor] = None,
         timestep_seq_len: Optional[int] = None,
-        projected_text: bool = False,
     ):
         timestep = self.timesteps_proj(timestep)
         if timestep_seq_len is not None:
@@ -344,8 +343,7 @@ class WanTimeTextImageEmbedding(nn.Module):
         temb = self.time_embedder(timestep).type_as(encoder_hidden_states)
         timestep_proj = self.time_proj(self.act_fn(temb))
 
-        if not projected_text:
-            encoder_hidden_states = self.text_embedder(encoder_hidden_states)
+        encoder_hidden_states = self.text_embedder(encoder_hidden_states)
         if encoder_hidden_states_image is not None:
             encoder_hidden_states_image = self.image_embedder(encoder_hidden_states_image)
 
@@ -628,8 +626,6 @@ class WanTransformer3DModel(
         encoder_hidden_states_image: Optional[torch.Tensor] = None,
         return_dict: bool = True,
         attention_kwargs: Optional[Dict[str, Any]] = None,
-        rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None, # <--- 1. ADD THIS
-        projected_text: bool = False,
     ) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
         hidden_states = mark_sharding(hidden_states, P("dp"))
         encoder_hidden_states = mark_sharding(encoder_hidden_states, P("dp"))
@@ -655,8 +651,7 @@ class WanTransformer3DModel(
         post_patch_height = height // p_h
         post_patch_width = width // p_w
 
-        if rotary_emb is None:
-            rotary_emb = self.rope(hidden_states)
+        rotary_emb = self.rope(hidden_states)
 
         hidden_states = self.patch_embedding(hidden_states)
         hidden_states = hidden_states.flatten(2).transpose(1, 2)
@@ -669,7 +664,7 @@ class WanTransformer3DModel(
             ts_seq_len = None
 
         temb, timestep_proj, encoder_hidden_states, encoder_hidden_states_image = self.condition_embedder(
-            timestep, encoder_hidden_states, encoder_hidden_states_image, timestep_seq_len=ts_seq_len, projected_text=projected_text
+            timestep, encoder_hidden_states, encoder_hidden_states_image, timestep_seq_len=ts_seq_len
         )
         if ts_seq_len is not None:
             # batch_size, seq_len, 6, inner_dim

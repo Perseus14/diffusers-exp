@@ -32,9 +32,6 @@ export LIBTPU_INIT_ARGS='--xla_tpu_dvfs_p_state=7 \
 --xla_tpu_use_minor_sharding_for_major_trivial_input=true \
 --xla_tpu_relayout_group_size_threshold_for_reduce_scatter=1 \
 --xla_tpu_enable_megacore=true \
---xla_tpu_strict_fp32_to_bf16_conversion=false \
---xla_tpu_use_enhanced_fp32_for_bf16_conversions=true \
---xla_tpu_enable_latency_hiding_scheduler=true \
 --xla_tpu_assign_all_reduce_scatter_layout=true' && \
 export HF_HUB_CACHE=/dev/shm/maxdiffusion_hf_cache/ && \
 export HF_HUB_ENABLE_HF_TRANSFER=1 && \
