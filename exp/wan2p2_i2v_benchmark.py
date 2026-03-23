@@ -38,7 +38,7 @@ from torchax.ops import jtorch
 from torchax.ops import ops_registry
 
 # Local file
-import custom_splash_attention
+import custom_splash_attention_modified as custom_splash_attention
 
 SIZE_CONFIGS = {
     "720*1280": (720, 1280),
@@ -273,7 +273,7 @@ def _tpu_custom_attention(query, key, value, mesh, scale=None):
         vmapped_kernel = jax.vmap(kernel_3d, in_axes=(0, 0, 0), out_axes=0)
         return vmapped_kernel(q, k, v)
 
-    if False and key.shape[0] > 1:
+    if True and key.shape[0] > 1:
         dp_mesh_key = "dp"
         remain_mesh_key = ("tp",)
     else:

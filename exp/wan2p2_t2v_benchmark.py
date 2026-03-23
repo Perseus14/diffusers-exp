@@ -36,7 +36,7 @@ from torchax.ops import jtorch
 from torchax.ops import ops_registry
 
 # Local file
-import custom_splash_attention
+import custom_splash_attention_modified as custom_splash_attention
 
 SIZE_CONFIGS = {
     "720*1280": (720, 1280),
