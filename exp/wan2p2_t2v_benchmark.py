@@ -598,7 +598,8 @@ def main(args: Args):
     )
     mesh = Mesh(mesh_devices, ("dp", "tp"))
     print(f"{mesh=}")
-
+    pipe.mesh = mesh
+    
     _overide_op_definition(
         env, torch.nn.functional.conv2d, functools.partial(_torch_conv2d, env=env)
     )
@@ -681,23 +682,7 @@ def main(args: Args):
                 guidance_scale = new_kwargs.pop('guidance_scale', 5.0) 
                 rotary_emb = new_kwargs.pop('rotary_emb', None)
                 if rotary_emb is not None:
-                    cos_pt, sin_pt = rotary_emb
-            
-                    try:
-                        # If they were successfully converted to Torchax tensors earlier
-                        j_freqs_cos, j_freqs_sin = env.t2j_iso((cos_pt, sin_pt))
-                    except AssertionError:
-                        # If they are stranded pure PyTorch tensors (due to persistent=False)
-                        import jax.numpy as jnp
-                        j_freqs_cos = jnp.array(cos_pt.detach().cpu().float().numpy(), dtype=jnp.bfloat16)
-                        j_freqs_sin = jnp.array(sin_pt.detach().cpu().float().numpy(), dtype=jnp.bfloat16)
-                
-                    # Fully replicate the RoPE tensors across the mesh (P())
-                    j_freqs_cos = jax.device_put(j_freqs_cos, NamedSharding(mesh, P()))
-                    j_freqs_sin = jax.device_put(j_freqs_sin, NamedSharding(mesh, P()))
-            
-                    t_freqs_cos, t_freqs_sin = env.j2t_iso((j_freqs_cos, j_freqs_sin))
-                    new_kwargs['rotary_emb'] = (t_freqs_cos, t_freqs_sin)
+                    new_kwargs['rotary_emb'] = rotary_emb
 
                 if hidden_states is not None: new_kwargs['hidden_states'] = t_hidden_states
                 if timestep is not None: new_kwargs['timestep'] = t_timestep

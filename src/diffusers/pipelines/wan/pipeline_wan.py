@@ -30,6 +30,11 @@ from ..pipeline_utils import DiffusionPipeline
 from .pipeline_output import WanPipelineOutput
 
 
+import jax
+import jax.numpy as jnp
+from jax.sharding import NamedSharding, PartitionSpec as P
+import torchax
+
 if is_torch_xla_available():
     import torch_xla.core.xla_model as xm
 
@@ -583,14 +588,23 @@ class WanPipeline(DiffusionPipeline, WanLoraLoaderMixin):
         mask = torch.ones(latents.shape, dtype=torch.float32, device=device)
 
         transformer_model = self.transformer if self.transformer is not None else self.transformer_2
-        
-        # Compute static RoPE on the latents' shape
-        rotary_emb = transformer_model.rope(latents.to(transformer_dtype))
-        
-        # Pre-project the text embeddings
-        prompt_embeds = transformer_model.condition_embedder.text_embedder(prompt_embeds)
-        if negative_prompt_embeds is not None:
-            negative_prompt_embeds = transformer_model.condition_embedder.text_embedder(negative_prompt_embeds)
+        mesh = self.mesh 
+        env = torchax.default_env()
+        with torch.no_grad():
+            # 1. Compute RoPE on CPU
+            cos_pt, sin_pt = transformer_model.rope(latents.cpu())
+            
+            # Convert to JAX, fully replicate, and push to TPU
+            j_freqs_cos = jax.device_put(jnp.array(cos_pt.numpy(), dtype=jnp.bfloat16), NamedSharding(mesh, P()))
+            j_freqs_sin = jax.device_put(jnp.array(sin_pt.numpy(), dtype=jnp.bfloat16), NamedSharding(mesh, P()))
+            
+            # Wrap in Torchax Views so the compiled model accepts them natively
+            t_freqs_cos, t_freqs_sin = env.j2t_iso((j_freqs_cos, j_freqs_sin))
+            static_rotary_emb = (t_freqs_cos, t_freqs_sin)
+
+            prompt_embeds = transformer_model.condition_embedder.text_embedder(prompt_embeds)
+            if negative_prompt_embeds is not None:
+                negative_prompt_embeds = transformer_model.condition_embedder.text_embedder(negative_prompt_embeds)
 
         # 6. Denoising loop
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
@@ -661,7 +675,7 @@ class WanPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                     encoder_hidden_states=batch_encoder_hidden_states,
                     guidance_scale=current_guidance_scale, # <--- Pass the scalar down
                     attention_kwargs=attention_kwargs,
-                    rotary_emb=rotary_emb,       # <--- ADD THIS
+                    rotary_emb=static_rotary_emb,       # <--- ADD THIS
                     projected_text=True,
                 )
 
