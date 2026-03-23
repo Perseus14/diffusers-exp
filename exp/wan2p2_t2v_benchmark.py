@@ -78,6 +78,7 @@ TEXT_ENCODER_SHARDINGS = {
     'encoder.block.*.layer.*.DenseReluDense.wo.weight': (None, 'tp',), 
 }
 
+'''
 # Added 'transformer.' prefix to all keys since the model is now wrapped in WanCFGWrapper
 TRANSFORMER_SHARDINGS = {
     'transformer.condition_embedder.time_embedder.linear_1.weight': ('tp',),
@@ -103,6 +104,59 @@ TRANSFORMER_SHARDINGS = {
     'transformer.blocks.*.ffn.net.*.proj.weight': ('tp',),
     'transformer.blocks.*.ffn.net.*.proj.bias': ('tp',),
     'transformer.blocks.*.ffn.net.*.weight': (None, 'tp',),
+}
+'''
+TRANSFORMER_SHARDINGS = {
+    # ---------------------------------------------------------
+    # 1. Condition Embedders (Time & Text)
+    # ---------------------------------------------------------
+    # Up-projections (Column Parallel: Shard out_features)
+    'transformer.condition_embedder.time_embedder.linear_1.weight': ('tp',),
+    'transformer.condition_embedder.time_embedder.linear_1.bias': ('tp',),
+    'transformer.condition_embedder.text_embedder.linear_1.weight': ('tp',),
+    'transformer.condition_embedder.text_embedder.linear_1.bias': ('tp',),
+    
+    # Down-projections (Row Parallel: Shard in_features)
+    'transformer.condition_embedder.time_embedder.linear_2.weight': (None, 'tp',),
+    'transformer.condition_embedder.time_embedder.linear_2.bias': (None,), # Replicated after All-Reduce
+    'transformer.condition_embedder.text_embedder.linear_2.weight': (None, 'tp',),
+    'transformer.condition_embedder.text_embedder.linear_2.bias': (None,), # Replicated after All-Reduce
+
+    # ---------------------------------------------------------
+    # 2. Self Attention (attn1) & Cross Attention (attn2)
+    # ---------------------------------------------------------
+    # Q, K, V Projections (Column Parallel: Shard out_features/heads)
+    'transformer.blocks.*.attn1.to_q.weight': ('tp',),
+    'transformer.blocks.*.attn1.to_q.bias': ('tp',),
+    'transformer.blocks.*.attn1.to_k.weight': ('tp',),
+    'transformer.blocks.*.attn1.to_k.bias': ('tp',),
+    'transformer.blocks.*.attn1.to_v.weight': ('tp',),
+    'transformer.blocks.*.attn1.to_v.bias': ('tp',),
+    
+    'transformer.blocks.*.attn2.to_q.weight': ('tp',),
+    'transformer.blocks.*.attn2.to_q.bias': ('tp',),
+    'transformer.blocks.*.attn2.to_k.weight': ('tp',),
+    'transformer.blocks.*.attn2.to_k.bias': ('tp',),
+    'transformer.blocks.*.attn2.to_v.weight': ('tp',),
+    'transformer.blocks.*.attn2.to_v.bias': ('tp',),
+
+    # Output Projections (Row Parallel: Shard in_features)
+    # Note: Using .0. because your code shows a ModuleList with Identity at .1.
+    'transformer.blocks.*.attn1.to_out.0.weight': (None, 'tp',),
+    'transformer.blocks.*.attn1.to_out.0.bias': (None,), # Replicated: added AFTER the ICI All-Reduce
+    'transformer.blocks.*.attn2.to_out.0.weight': (None, 'tp',),
+    'transformer.blocks.*.attn2.to_out.0.bias': (None,), 
+
+    # ---------------------------------------------------------
+    # 3. Feed-Forward Network (FFN) / MoE
+    # ---------------------------------------------------------
+    # Gate/Up Projections (Column Parallel: Shard out_features)
+    'transformer.blocks.*.ffn.net.0.proj.weight': ('tp',),
+    'transformer.blocks.*.ffn.net.0.proj.bias': ('tp',),
+    
+    # Down Projections (Row Parallel: Shard in_features)
+    'transformer.blocks.*.ffn.net.2.weight': (None, 'tp',),
+    'transformer.blocks.*.ffn.net.2.bias': (None,), # Replicated: added AFTER the ICI All-Reduce
 }
 
 VAE_ENCODER_SHARDINGS = {}
@@ -480,13 +534,15 @@ class WanCFGWrapper(torch.nn.Module):
         self.config = model.config
         self.dtype = model.dtype
 
-    def forward(self, hidden_states, timestep, encoder_hidden_states, guidance_scale, **kwargs):
+    def forward(self, hidden_states, timestep, encoder_hidden_states, guidance_scale, rotary_emb=None, projected_text=False, **kwargs):
         # Run the batch=2 forward pass
         batch_noise = self.transformer(
             hidden_states=hidden_states,
             timestep=timestep,
             encoder_hidden_states=encoder_hidden_states,
             return_dict=False,
+            rotary_emb=rotary_emb,         # <--- ADD THIS
+            projected_text=projected_text, # <--- ADD THIS
             **kwargs
         )[0]
         
@@ -583,15 +639,25 @@ def main(args: Args):
             pipe.text_encoder = TextEncoderShardingWrapper(compiled_text_encoder)
             
         transformer_options = torchax.CompileOptions(
-            jax_jit_kwargs={"static_argnames": ("return_dict",)}
+            jax_jit_kwargs={"static_argnames": ("return_dict", "projected_text")}
         )
         
         class TransformerShardingWrapper:
-            def __init__(self, compiled_transformer):
+            def __init__(self, compiled_transformer, original_module):
                 self.compiled_transformer = compiled_transformer
+                self.original_module = original_module
                 self.dtype = compiled_transformer.dtype
                 self.config = compiled_transformer.config
-                
+            
+            # 2. Expose the specific submodules for the pipeline to use
+            @property
+            def rope(self):
+                return self.original_module.transformer.rope
+        
+            @property
+            def condition_embedder(self):
+                return self.original_module.transformer.condition_embedder
+
             def __call__(self, **kwargs):
                 hidden_states = kwargs.get('hidden_states')
                 timestep = kwargs.get('timestep')
@@ -613,7 +679,26 @@ def main(args: Args):
                 
                 new_kwargs = kwargs.copy()
                 guidance_scale = new_kwargs.pop('guidance_scale', 5.0) 
+                rotary_emb = new_kwargs.pop('rotary_emb', None)
+                if rotary_emb is not None:
+                    cos_pt, sin_pt = rotary_emb
+            
+                    try:
+                        # If they were successfully converted to Torchax tensors earlier
+                        j_freqs_cos, j_freqs_sin = env.t2j_iso((cos_pt, sin_pt))
+                    except AssertionError:
+                        # If they are stranded pure PyTorch tensors (due to persistent=False)
+                        import jax.numpy as jnp
+                        j_freqs_cos = jnp.array(cos_pt.detach().cpu().float().numpy(), dtype=jnp.bfloat16)
+                        j_freqs_sin = jnp.array(sin_pt.detach().cpu().float().numpy(), dtype=jnp.bfloat16)
                 
+                    # Fully replicate the RoPE tensors across the mesh (P())
+                    j_freqs_cos = jax.device_put(j_freqs_cos, NamedSharding(mesh, P()))
+                    j_freqs_sin = jax.device_put(j_freqs_sin, NamedSharding(mesh, P()))
+            
+                    t_freqs_cos, t_freqs_sin = env.j2t_iso((j_freqs_cos, j_freqs_sin))
+                    new_kwargs['rotary_emb'] = (t_freqs_cos, t_freqs_sin)
+
                 if hidden_states is not None: new_kwargs['hidden_states'] = t_hidden_states
                 if timestep is not None: new_kwargs['timestep'] = t_timestep
                 if encoder_hidden_states is not None: new_kwargs['encoder_hidden_states'] = t_encoder_hidden_states
@@ -637,7 +722,7 @@ def main(args: Args):
             compiled_transformer.buffers = _shard_weight_dict(
                 compiled_transformer.buffers, TRANSFORMER_SHARDINGS, mesh
             )
-            pipe.transformer = TransformerShardingWrapper(compiled_transformer)
+            pipe.transformer = TransformerShardingWrapper(compiled_transformer, wrapped_transformer)
 
         with perf_time("  Move transformer2"):
             if getattr(pipe, "transformer_2", None) is not None:
@@ -657,7 +742,7 @@ def main(args: Args):
                 compiled_transformer_2.buffers = _shard_weight_dict(
                     compiled_transformer_2.buffers, TRANSFORMER_SHARDINGS, mesh
                 )
-                pipe.transformer_2 = TransformerShardingWrapper(compiled_transformer_2)
+                pipe.transformer_2 = TransformerShardingWrapper(compiled_transformer_2, wrapped_transformer_2)
 
         with perf_time("  Move scheduler"):
             # 1. Instantiate our new wrapper

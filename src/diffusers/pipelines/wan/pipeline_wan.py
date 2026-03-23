@@ -582,6 +582,16 @@ class WanPipeline(DiffusionPipeline, WanLoraLoaderMixin):
 
         mask = torch.ones(latents.shape, dtype=torch.float32, device=device)
 
+        transformer_model = self.transformer if self.transformer is not None else self.transformer_2
+        
+        # Compute static RoPE on the latents' shape
+        rotary_emb = transformer_model.rope(latents.to(transformer_dtype))
+        
+        # Pre-project the text embeddings
+        prompt_embeds = transformer_model.condition_embedder.text_embedder(prompt_embeds)
+        if negative_prompt_embeds is not None:
+            negative_prompt_embeds = transformer_model.condition_embedder.text_embedder(negative_prompt_embeds)
+
         # 6. Denoising loop
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
         self._num_timesteps = len(timesteps)
@@ -651,6 +661,8 @@ class WanPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                     encoder_hidden_states=batch_encoder_hidden_states,
                     guidance_scale=current_guidance_scale, # <--- Pass the scalar down
                     attention_kwargs=attention_kwargs,
+                    rotary_emb=rotary_emb,       # <--- ADD THIS
+                    projected_text=True,
                 )
 
                 # compute the previous noisy sample x_t -> x_t-1
