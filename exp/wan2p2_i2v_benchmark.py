@@ -22,11 +22,13 @@ from jax.experimental.pallas.ops.tpu import splash_attention
 
 import torch
 import numpy as np
-from diffusers import WanPipeline
-from diffusers.utils import export_to_video
+from diffusers import WanImageToVideoPipeline
+from diffusers.utils import export_to_video, load_image
 from diffusers.models.autoencoders import vae as diffusers_vae
-from diffusers.models.autoencoders.vae import DecoderOutput
+from diffusers.models.autoencoders.vae import DecoderOutput, DiagonalGaussianDistribution
 from diffusers.models import modeling_outputs as diffusers_modeling_outputs
+from diffusers.models.modeling_outputs import AutoencoderKLOutput
+from diffusers.models.autoencoders.autoencoder_kl_wan import WanCausalConv3d, patchify
 
 from transformers import modeling_outputs
 
@@ -410,6 +412,7 @@ class Args(argparse.Namespace):
     frame_num: int
     prompt: str
     base_seed: int
+    image: str
     sample_steps: int
     print_weights: bool
     profile: str
@@ -452,6 +455,12 @@ def parse_args():
         help="The seed to use for generating the video. Need to specify for multi-host sync.",
     )
     parser.add_argument(
+        "--image",
+        type=str,
+        default=DEFAULT_IMAGE_PATH,
+        help="The image to generate the video from.",
+    )
+    parser.add_argument(
         "--sample_steps", type=int, default=40, help="The sampling steps."
     )
     parser.add_argument(
@@ -483,8 +492,6 @@ def parse_args():
     parser.add_argument("--bkv_compute_in", type=int, default=1024, help="Input block size for Splash Attention")
 
     return parser.parse_args(namespace=Args())
-
-from diffusers.models.autoencoders.autoencoder_kl_wan import WanCausalConv3d, patchify
 
 class WanVAEEncodeWrapper(torch.nn.Module):
     def __init__(self, vae):
@@ -574,7 +581,7 @@ class WanCFGWrapper(torch.nn.Module):
         self.config = model.config
         self.dtype = model.dtype
 
-    def forward(self, hidden_states, timestep, encoder_hidden_states, guidance_scale, rotary_emb=None, projected_text=False, projected_image=False, **kwargs):
+    def forward(self, hidden_states, timestep, encoder_hidden_states, guidance_scale, rotary_emb=None, cross_attn_kv_cache=None, **kwargs):
         # Run the batch=2 forward pass
         batch_noise = self.transformer(
             hidden_states=hidden_states,
@@ -582,8 +589,9 @@ class WanCFGWrapper(torch.nn.Module):
             encoder_hidden_states=encoder_hidden_states,
             return_dict=False,
             rotary_emb=rotary_emb,         # <--- ADD THIS
-            projected_text=projected_text, # <--- ADD THIS
-            projected_image=projected_image,
+            projected_text=True,           # <--- HARCODED TRUE
+            projected_image=True,          # <--- HARCODED TRUE
+            cross_attn_kv_cache=cross_attn_kv_cache,
             **kwargs
         )[0]
         
@@ -737,6 +745,8 @@ def main(args: Args):
                 
                 new_kwargs = kwargs.copy()
                 guidance_scale = new_kwargs.pop('guidance_scale', 5.0) 
+                projected_text = new_kwargs.pop('projected_text', False)
+                projected_image = new_kwargs.pop('projected_image', False)
                 rotary_emb = new_kwargs.pop('rotary_emb', None)
                 if rotary_emb is not None:
                     new_kwargs['rotary_emb'] = rotary_emb
@@ -842,11 +852,8 @@ def main(args: Args):
             compiled_vae_encoder.buffers = _shard_weight_dict(compiled_vae_encoder.buffers, VAE_ENCODER_SHARDINGS, mesh)
             
             # 4. Override the pipeline's encode method
-            def custom_vae_encode(x, return_dict=False):
+            def custom_vae_encode(x, return_dict=True):
                 # Ensure it enters the compiled graph directly
-                from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
-                from diffusers.models.modeling_outputs import AutoencoderKLOutput
-                
                 out = compiled_vae_encoder(x)
                 posterior = DiagonalGaussianDistribution(out)
                 if not return_dict:
@@ -952,3 +959,4 @@ if __name__ == "__main__":
     args = parse_args()
     print(args)
     main(args)
+
