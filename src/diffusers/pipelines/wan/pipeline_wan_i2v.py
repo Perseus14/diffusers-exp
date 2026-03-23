@@ -32,6 +32,11 @@ from ..pipeline_utils import DiffusionPipeline
 from .pipeline_output import WanPipelineOutput
 
 
+import jax
+import jax.numpy as jnp
+from jax.sharding import NamedSharding, PartitionSpec as P
+import torchax
+
 if is_torch_xla_available():
     import torch_xla.core.xla_model as xm
 
@@ -715,6 +720,76 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
         else:
             latents, condition = latents_outputs
 
+        transformer_model = self.transformer if self.transformer is not None else self.transformer_2
+        mesh = getattr(self, "mesh", None)
+        env = getattr(torchax, "default_env", lambda: None)()
+        with torch.no_grad():
+            if mesh is not None and env is not None:
+                # 1. Compute RoPE on CPU
+                cos_pt, sin_pt = transformer_model.rope(latents.cpu())
+                
+                # Convert to JAX, fully replicate, and push to TPU
+                j_freqs_cos = jax.device_put(jnp.array(cos_pt.numpy(), dtype=jnp.bfloat16), NamedSharding(mesh, P()))
+                j_freqs_sin = jax.device_put(jnp.array(sin_pt.numpy(), dtype=jnp.bfloat16), NamedSharding(mesh, P()))
+                
+                # Wrap in Torchax Views so the compiled model accepts them natively
+                t_freqs_cos, t_freqs_sin = env.j2t_iso((j_freqs_cos, j_freqs_sin))
+                static_rotary_emb = (t_freqs_cos, t_freqs_sin)
+
+                prompt_embeds = transformer_model.condition_embedder.text_embedder(prompt_embeds)
+                if negative_prompt_embeds is not None:
+                    negative_prompt_embeds = transformer_model.condition_embedder.text_embedder(negative_prompt_embeds)
+                
+                if image_embeds is not None and transformer_model.condition_embedder.image_embedder is not None:
+                    image_embeds = transformer_model.condition_embedder.image_embedder(image_embeds)
+
+                # 2. GENERATE THE CROSS-ATTN KV CACHE ON TPU
+                j_prompt_embeds = env.t2j_iso(prompt_embeds)
+                j_neg_embeds = env.t2j_iso(negative_prompt_embeds) if negative_prompt_embeds is not None else None
+                j_image_embeds = env.t2j_iso(image_embeds) if image_embeds is not None else None
+                
+                # Combine pos and neg prompts for the batch=2 forward pass
+                if j_neg_embeds is not None:
+                    j_batch_text = jnp.concatenate([j_prompt_embeds, j_neg_embeds], axis=0)
+                else:
+                    j_batch_text = j_prompt_embeds
+                
+                if j_image_embeds is not None:
+                    if j_neg_embeds is not None:
+                        j_batch_image = jnp.concatenate([j_image_embeds, j_image_embeds], axis=0)
+                    else:
+                        j_batch_image = j_image_embeds
+                else:
+                    j_batch_image = None
+
+                text_sharding = NamedSharding(mesh, P('dp', None, None))
+                j_batch_text = jax.device_put(j_batch_text, text_sharding)
+                j_batch_text_t = env.j2t_iso(j_batch_text)
+
+                if j_batch_image is not None:
+                    j_batch_image = jax.device_put(j_batch_image, text_sharding)
+                    j_batch_image_t = env.j2t_iso(j_batch_image)
+                else:
+                    j_batch_image_t = None
+
+                static_kv_cache_1 = None
+                if getattr(self, "compiled_cache_generator", None) is not None:
+                    flat_cache_j_1 = self.compiled_cache_generator(j_batch_text_t, j_batch_image_t)
+                    static_kv_cache_1 = []
+                    for idx in range(0, len(flat_cache_j_1), 2):
+                        static_kv_cache_1.append((flat_cache_j_1[idx], flat_cache_j_1[idx+1]))
+
+                static_kv_cache_2 = None
+                if getattr(self, "compiled_cache_generator_2", None) is not None:
+                    flat_cache_j_2 = self.compiled_cache_generator_2(j_batch_text_t, j_batch_image_t)
+                    static_kv_cache_2 = []
+                    for idx in range(0, len(flat_cache_j_2), 2):
+                        static_kv_cache_2.append((flat_cache_j_2[idx], flat_cache_j_2[idx+1]))
+            else:
+                static_rotary_emb = None
+                static_kv_cache_1 = None
+                static_kv_cache_2 = None
+
         # 6. Denoising loop
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
         self._num_timesteps = len(timesteps)
@@ -736,10 +811,12 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                     # wan2.1 or high-noise stage in wan2.2
                     current_model = self.transformer
                     current_guidance_scale = guidance_scale
+                    current_kv_cache = static_kv_cache_1
                 else:
                     # low-noise stage in wan2.2
                     current_model = self.transformer_2
                     current_guidance_scale = guidance_scale_2
+                    current_kv_cache = static_kv_cache_2
 
                 if self.config.expand_timesteps:
                     latent_model_input = (1 - first_frame_mask) * condition + first_frame_mask * latents
@@ -786,21 +863,35 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                     batch_encoder_hidden_states = prompt_embeds
                     batch_encoder_hidden_states_image = image_embeds
 
-                batch_noise = current_model(
+                noise_pred = current_model(
                     hidden_states=batch_latent_model_input,
                     timestep=batch_timestep,
                     encoder_hidden_states=batch_encoder_hidden_states,
                     encoder_hidden_states_image=batch_encoder_hidden_states_image,
+                    guidance_scale=current_guidance_scale, 
                     attention_kwargs=attention_kwargs,
-                    return_dict=False,
-                )[0] # return is tuple
-                noise_pred = batch_noise[0:1]
-                if self.do_classifier_free_guidance:
-                    noise_uncond = batch_noise[1:2]
-                    noise_pred = noise_uncond + current_guidance_scale * (noise_pred - noise_uncond)
+                    rotary_emb=static_rotary_emb, 
+                    projected_text=True,
+                    projected_image=True,
+                    cross_attn_kv_cache=current_kv_cache,
+                )
 
                 # compute the previous noisy sample x_t -> x_t-1
-                latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+                if hasattr(self, "compiled_scheduler_step"):
+                    # Grab the scalar step sizes directly from the HF scheduler
+                    sigma = self.scheduler.sigmas[i]
+                    sigma_next = self.scheduler.sigmas[i + 1]
+
+                    # Fire the compiled XLA math!
+                    latents = self.compiled_scheduler_step(
+                        sample=latents,
+                        noise_pred=noise_pred,
+                        sigma=sigma,
+                        sigma_next=sigma_next
+                    )
+                else:
+                    # Fallback to standard eager HF step if not compiled
+                    latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
 
                 if callback_on_step_end is not None:
                     callback_kwargs = {}

@@ -136,12 +136,13 @@ class WanAttnProcessor:
 
         # I2V task
         hidden_states_img = None
-        if encoder_hidden_states_img is not None:
-            key_img, value_img = _get_added_kv_projections(attn, encoder_hidden_states_img)
-            key_img = attn.norm_added_k(key_img)
+        if encoder_hidden_states_img is not None or (cross_attn_kv_cache is not None and len(cross_attn_kv_cache) == 4):
+            if cross_attn_kv_cache is None or len(cross_attn_kv_cache) != 4:
+                key_img, value_img = _get_added_kv_projections(attn, encoder_hidden_states_img)
+                key_img = attn.norm_added_k(key_img)
 
-            key_img = key_img.unflatten(2, (attn.heads, -1))
-            value_img = value_img.unflatten(2, (attn.heads, -1))
+                key_img = key_img.unflatten(2, (attn.heads, -1))
+                value_img = value_img.unflatten(2, (attn.heads, -1))
 
             hidden_states_img = dispatch_attention_fn(
                 query,
@@ -355,6 +356,7 @@ class WanTimeTextImageEmbedding(nn.Module):
         encoder_hidden_states_image: Optional[torch.Tensor] = None,
         timestep_seq_len: Optional[int] = None,
         projected_text: bool = False,
+        projected_image: bool = False,
     ):
         timestep = self.timesteps_proj(timestep)
         if timestep_seq_len is not None:
@@ -368,7 +370,7 @@ class WanTimeTextImageEmbedding(nn.Module):
 
         if not projected_text:
             encoder_hidden_states = self.text_embedder(encoder_hidden_states)
-        if encoder_hidden_states_image is not None:
+        if not projected_image and encoder_hidden_states_image is not None:
             encoder_hidden_states_image = self.image_embedder(encoder_hidden_states_image)
 
         return temb, timestep_proj, encoder_hidden_states, encoder_hidden_states_image
@@ -653,6 +655,7 @@ class WanTransformer3DModel(
         attention_kwargs: Optional[Dict[str, Any]] = None,
         rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         projected_text: bool = False,
+        projected_image: bool = False,
         cross_attn_kv_cache: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
     ) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
         hidden_states = mark_sharding(hidden_states, P("dp"))
@@ -693,7 +696,7 @@ class WanTransformer3DModel(
             ts_seq_len = None
 
         temb, timestep_proj, encoder_hidden_states, encoder_hidden_states_image = self.condition_embedder(
-            timestep, encoder_hidden_states, encoder_hidden_states_image, timestep_seq_len=ts_seq_len, projected_text=projected_text
+            timestep, encoder_hidden_states, encoder_hidden_states_image, timestep_seq_len=ts_seq_len, projected_text=projected_text, projected_image=projected_image
         )
         if ts_seq_len is not None:
             # batch_size, seq_len, 6, inner_dim

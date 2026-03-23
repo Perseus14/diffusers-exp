@@ -1,0 +1,954 @@
+import os
+# Crank it up to 3 (FATAL only) to be absolutely sure
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+os.environ['GLOG_minloglevel'] = '3'
+os.environ['XLA_CPP_MIN_LOG_LEVEL'] = '3'
+os.environ['JAX_CPP_MIN_LOG_LEVEL'] = '3'
+
+import argparse
+from datetime import datetime
+import functools
+import math
+import re
+import time
+from contextlib import contextmanager
+
+import jax
+import jax.numpy as jnp
+from jax.sharding import NamedSharding, PartitionSpec as P
+from jax.sharding import Mesh
+from jax.experimental import mesh_utils
+from jax.experimental.pallas.ops.tpu import splash_attention
+
+import torch
+import numpy as np
+from diffusers import WanPipeline
+from diffusers.utils import export_to_video
+from diffusers.models.autoencoders import vae as diffusers_vae
+from diffusers.models.autoencoders.vae import DecoderOutput
+from diffusers.models import modeling_outputs as diffusers_modeling_outputs
+
+from transformers import modeling_outputs
+
+import torchax
+from torchax.ops import jaten
+from torchax.ops import jtorch
+from torchax.ops import ops_registry
+
+# Local file
+import custom_splash_attention
+
+SIZE_CONFIGS = {
+    "720*1280": (720, 1280),
+    "1280*720": (1280, 720),
+    "480*832": (480, 832),
+    "832*480": (832, 480),
+}
+
+SUPPORTED_SIZES = {
+    "t2v-A14B": ("720*1280", "1280*720", "480*832", "832*480"),
+    "i2v-A14B": ("720*1280", "1280*720", "480*832", "832*480"),
+    "ti2v-5B": ("704*1280", "1280*704"),
+    "s2v-14B": (
+        "720*1280",
+        "1280*720",
+        "480*832",
+        "832*480",
+        "1024*704",
+        "704*1024",
+        "704*1280",
+        "1280*704",
+    ),
+    "animate-14B": ("720*1280", "1280*720"),
+}
+
+DEFAULT_PROMPT = "Summer beach vacation style, a white cat wearing sunglasses sits on a surfboard. The fluffy-furred feline gazes directly at the camera with a relaxed expression. Blurred beach scenery forms the background featuring crystal-clear waters, distant green hills, and a blue sky dotted with white clouds. The cat assumes a naturally relaxed posture, as if savoring the sea breeze and warm sunlight. A close-up shot highlights the feline's intricate details and the refreshing atmosphere of the seaside."
+DEFAULT_NEG_PROMPT = "Overly vibrant colors, overexposed, static, blurred details, subtitles, style, artwork, painting, picture, still, washed out, worst quality, low quality, JPEG artifacts, ugly, mutilated, extra fingers, poorly drawn hands, poorly drawn face, deformed, disfigured, deformed limbs, fused fingers, motionless scene, cluttered background, three legs, crowded background, walking backwards"
+DEFAULT_IMAGE_PATH = "https://huggingface.co/datasets/YiYiXu/testing-images/resolve/main/wan_i2v_input.JPG"
+DEFAULT_PROFILE_OUT_PATH = "/tmp/wan_prof"
+
+# fmt: off
+TEXT_ENCODER_SHARDINGS = {
+    'shared.weight': ('tp',), 
+    'encoder.block.*.layer.*.SelfAttention.q.weight': ('tp',), 
+    'encoder.block.*.layer.*.SelfAttention.k.weight': ('tp',), 
+    'encoder.block.*.layer.*.SelfAttention.v.weight': ('tp',), 
+    'encoder.block.*.layer.*.SelfAttention.o.weight': (None, 'tp',), 
+    'encoder.block.*.layer.*.DenseReluDense.wi_0.weight': ('tp',), 
+    'encoder.block.*.layer.*.DenseReluDense.wi_1.weight': ('tp',), 
+    'encoder.block.*.layer.*.DenseReluDense.wo.weight': (None, 'tp',), 
+}
+
+'''
+# Added 'transformer.' prefix to all keys since the model is now wrapped in WanCFGWrapper
+TRANSFORMER_SHARDINGS = {
+    'transformer.condition_embedder.time_embedder.linear_1.weight': ('tp',),
+    'transformer.condition_embedder.time_embedder.linear_1.bias': ('tp',),
+    'transformer.condition_embedder.time_embedder.linear_2.weight': (None, 'tp',),
+    'transformer.condition_embedder.text_embedder.linear_1.weight': ('tp',),
+    'transformer.condition_embedder.text_embedder.linear_1.bias': ('tp',),
+    'transformer.condition_embedder.text_embedder.linear_2.weight': (None, 'tp',),
+    'transformer.blocks.*.attn1.to_q.weight': ('tp',),
+    'transformer.blocks.*.attn1.to_q.bias': ('tp',),
+    'transformer.blocks.*.attn1.to_k.weight': ('tp',),
+    'transformer.blocks.*.attn1.to_k.bias': ('tp',),
+    'transformer.blocks.*.attn1.to_v.weight': ('tp',),
+    'transformer.blocks.*.attn1.to_v.bias': ('tp',),
+    'transformer.blocks.*.attn1.to_out.*.weight': (None, 'tp',), # Kept .* because it is a ModuleList with Identity
+    'transformer.blocks.*.attn2.to_q.weight': ('tp',),
+    'transformer.blocks.*.attn2.to_q.bias': ('tp',),
+    'transformer.blocks.*.attn2.to_k.weight': ('tp',),
+    'transformer.blocks.*.attn2.to_k.bias': ('tp',),
+    'transformer.blocks.*.attn2.to_v.weight': ('tp',),
+    'transformer.blocks.*.attn2.to_v.bias': ('tp',),
+    'transformer.blocks.*.attn2.to_out.*.weight': (None, 'tp',), # Kept .* because it is a ModuleList with Identity
+    'transformer.blocks.*.ffn.net.*.proj.weight': ('tp',),
+    'transformer.blocks.*.ffn.net.*.proj.bias': ('tp',),
+    'transformer.blocks.*.ffn.net.*.weight': (None, 'tp',),
+}
+'''
+TRANSFORMER_SHARDINGS = {
+    # ---------------------------------------------------------
+    # 1. Condition Embedders (Time & Text)
+    # ---------------------------------------------------------
+    # Up-projections (Column Parallel: Shard out_features)
+    'transformer.condition_embedder.time_embedder.linear_1.weight': ('tp',),
+    'transformer.condition_embedder.time_embedder.linear_1.bias': ('tp',),
+    'transformer.condition_embedder.text_embedder.linear_1.weight': ('tp',),
+    'transformer.condition_embedder.text_embedder.linear_1.bias': ('tp',),
+    
+    # Down-projections (Row Parallel: Shard in_features)
+    'transformer.condition_embedder.time_embedder.linear_2.weight': (None, 'tp',),
+    'transformer.condition_embedder.time_embedder.linear_2.bias': (None,), # Replicated after All-Reduce
+    'transformer.condition_embedder.text_embedder.linear_2.weight': (None, 'tp',),
+    'transformer.condition_embedder.text_embedder.linear_2.bias': (None,), # Replicated after All-Reduce
+
+    # ---------------------------------------------------------
+    # 2. Self Attention (attn1) & Cross Attention (attn2)
+    # ---------------------------------------------------------
+    # Q, K, V Projections (Column Parallel: Shard out_features/heads)
+    'transformer.blocks.*.attn1.to_q.weight': ('tp',),
+    'transformer.blocks.*.attn1.to_q.bias': ('tp',),
+    'transformer.blocks.*.attn1.to_k.weight': ('tp',),
+    'transformer.blocks.*.attn1.to_k.bias': ('tp',),
+    'transformer.blocks.*.attn1.to_v.weight': ('tp',),
+    'transformer.blocks.*.attn1.to_v.bias': ('tp',),
+    
+    'transformer.blocks.*.attn2.to_q.weight': ('tp',),
+    'transformer.blocks.*.attn2.to_q.bias': ('tp',),
+    'transformer.blocks.*.attn2.to_k.weight': ('tp',),
+    'transformer.blocks.*.attn2.to_k.bias': ('tp',),
+    'transformer.blocks.*.attn2.to_v.weight': ('tp',),
+    'transformer.blocks.*.attn2.to_v.bias': ('tp',),
+
+    # Output Projections (Row Parallel: Shard in_features)
+    # Note: Using .0. because your code shows a ModuleList with Identity at .1.
+    'transformer.blocks.*.attn1.to_out.0.weight': (None, 'tp',),
+    'transformer.blocks.*.attn1.to_out.0.bias': (None,), # Replicated: added AFTER the ICI All-Reduce
+    'transformer.blocks.*.attn2.to_out.0.weight': (None, 'tp',),
+    'transformer.blocks.*.attn2.to_out.0.bias': (None,), 
+
+    # ---------------------------------------------------------
+    # 3. Feed-Forward Network (FFN) / MoE
+    # ---------------------------------------------------------
+    # Gate/Up Projections (Column Parallel: Shard out_features)
+    'transformer.blocks.*.ffn.net.0.proj.weight': ('tp',),
+    'transformer.blocks.*.ffn.net.0.proj.bias': ('tp',),
+    
+    # Down Projections (Row Parallel: Shard in_features)
+    'transformer.blocks.*.ffn.net.2.weight': (None, 'tp',),
+    'transformer.blocks.*.ffn.net.2.bias': (None,), # Replicated: added AFTER the ICI All-Reduce
+}
+
+VAE_ENCODER_SHARDINGS = {}
+VAE_DECODER_SHARDINGS = {}
+# fmt: on
+
+BQSIZE = 3328
+BKVSIZE = 2816
+BKVCOMPUTESIZE = 256
+BKVCOMPUTEINSIZE = 256
+
+@contextmanager
+def perf_time(name: str):
+    print(f"{name} start")
+    start = time.perf_counter()
+    yield
+    end = time.perf_counter()
+    print(f"{name}: {end - start: .6f}s")
+
+
+def _print_weights(module):
+    def make_key(name):
+        return re.sub(r"\.\d+\.", ".*.", name)
+
+    all_buffers = dict(module.named_parameters())
+    all_buffers.update(module.named_buffers())
+    result = {}
+    for k, v in all_buffers.items():
+        result[make_key(k)] = (v.shape, v.dtype)
+    print("{")
+    for k, v in result.items():
+        print(f"'{k}': (), # {v}")
+    print("}")
+
+
+def _torch_conv2d(
+    input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1, *, env
+):
+    jinput, jweight, jbias = env.t2j_iso((input, weight, bias))
+    res = jaten._aten_conv2d(jinput, jweight, jbias, stride, padding, dilation, groups)
+    return env.j2t_iso(res)
+
+
+def _overide_op_definition(env, op_to_override, op_impl):
+    env._ops[op_to_override] = ops_registry.Operator(
+        op_to_override,
+        op_impl,
+        is_jax_function=False,
+        is_user_defined=True,
+        needs_env=False,
+        is_view_op=False,
+    )
+
+
+def _shard_weight_dict(weight_dict, sharding_dict, mesh):
+    result = {}
+    for k, v in weight_dict.items():
+        if isinstance(v, torch.Tensor):
+            v = v.to("jax")
+        for target, sharding in sharding_dict.items():
+            if re.fullmatch(target, k) is not None:
+                v.apply_jax_(jax.device_put, NamedSharding(mesh, P(*sharding)))
+                break
+        else:
+            v.apply_jax_(jax.device_put, NamedSharding(mesh, P()))
+
+        result[k] = v
+    return result
+
+
+def _move_module(env, module):
+    with jax.default_device("cpu"):
+        state_dict = module.state_dict()
+        state_dict = env.to_xla(state_dict)
+        module.load_state_dict(state_dict, assign=True)
+
+
+### Flash Attention
+def pad_to_multiple(x, multiple, axis):
+    seq_len = x.shape[axis]
+    pad_len = (multiple - seq_len % multiple) % multiple
+    if pad_len == 0:
+        return x, seq_len
+    pad_width = [(0, 0)] * x.ndim
+    pad_width[axis] = (0, pad_len)
+    return jnp.pad(x, pad_width), seq_len
+
+
+def _tpu_custom_attention(query, key, value, mesh, scale=None):
+    def _attention_on_slices(q, k, v):
+        scale_factor = 1.0 / math.sqrt(q.shape[-1]) if scale is None else scale
+        _LOG2_E = 1.44269504
+        q = q * scale_factor * _LOG2_E
+
+        def kernel_3d(q_3d, k_3d, v_3d):
+            q_seq_len = q_3d.shape[1]
+            kv_seq_len = k_3d.shape[1]
+            num_heads_on_device = q_3d.shape[0]
+            block_sizes = splash_attention.BlockSizes(
+                block_q=min(BQSIZE, q_seq_len),
+                block_kv=min(BKVSIZE, kv_seq_len),
+                block_kv_compute=min(BKVCOMPUTESIZE, kv_seq_len),
+            )
+            splash_kernel = custom_splash_attention.make_splash_mha(
+                block_sizes=block_sizes, bkv_compute_in=BKVCOMPUTEINSIZE
+            )
+            out = splash_kernel(q_3d, k_3d, v_3d).astype(q_3d.dtype)
+            out = jnp.swapaxes(out, 1, 2)
+            return out
+
+        vmapped_kernel = jax.vmap(kernel_3d, in_axes=(0, 0, 0), out_axes=0)
+        return vmapped_kernel(q, k, v)
+
+    if False and key.shape[0] > 1:
+        dp_mesh_key = "dp"
+        remain_mesh_key = ("tp",)
+    else:
+        dp_mesh_key = None
+        remain_mesh_key = ("dp", "tp")
+    
+    remain_devices_prod = 1
+    for d in remain_mesh_key:
+        remain_devices_prod *= mesh.axis_sizes[mesh.axis_names.index(d)]
+
+    q_num_head = query.shape[1]
+    q_seq_len = query.shape[2]
+    kv_num_head = key.shape[1]
+    kv_seq_len = key.shape[2]
+    
+    if (
+        kv_seq_len > 10000
+        and kv_num_head % remain_devices_prod == 0
+        and q_num_head % remain_devices_prod == 0
+    ):
+        q_partition_spec = P(dp_mesh_key, remain_mesh_key, None, None)
+        kv_partition_spec = P(dp_mesh_key, remain_mesh_key, None, None)
+    else:
+        if q_seq_len % remain_devices_prod != 0:
+            query, _ = pad_to_multiple(query, remain_devices_prod, axis=2)
+
+        q_partition_spec = P(dp_mesh_key, None, remain_mesh_key, None)
+        kv_partition_spec = P(dp_mesh_key, None, None, None)
+
+    sharded_fn = jax.shard_map(
+        _attention_on_slices,
+        mesh=mesh,
+        in_specs=(q_partition_spec, kv_partition_spec, kv_partition_spec),
+        out_specs=q_partition_spec,
+        check_vma=False,
+    )
+    query = jax.lax.with_sharding_constraint(query, P(dp_mesh_key, None, remain_mesh_key, None))
+    key = jax.lax.with_sharding_constraint(key, P(dp_mesh_key, None, remain_mesh_key, None))
+    value = jax.lax.with_sharding_constraint(value, P(dp_mesh_key, None, remain_mesh_key, None))
+    
+    out = sharded_fn(query, key, value)
+    out = out[:, :, :q_seq_len, :]
+    out = jax.lax.with_sharding_constraint(out, P(dp_mesh_key, None, remain_mesh_key, None))
+    return out
+
+
+def _scaled_dot_product_attention(
+    query,
+    key,
+    value,
+    attn_mask=None,
+    dropout_p=0.0,
+    is_causal=False,
+    scale=None,
+    enable_gqa=False,
+    *,
+    env,
+    mesh,
+) -> torch.Tensor:
+    if key.shape[2] > 20000:
+        assert attn_mask is None
+        assert dropout_p == 0.0
+        assert is_causal is False
+        assert enable_gqa is False
+        assert scale is None
+        jquery, jkey, jvalue = env.t2j_iso((query, key, value))
+        res = _tpu_custom_attention(jquery, jkey, jvalue, mesh, scale=scale)
+        return env.j2t_iso(res)
+
+    return jtorch._sdpa_reference(
+        query, key, value, attn_mask, dropout_p, is_causal, scale, enable_gqa
+    )
+
+
+# register non-jax type
+def _flatten_model_output(output):
+    return tuple(output.values()), (type(output), tuple(output.keys()))
+
+def _unflatten_model_output(aux, children):
+    cls, keys = aux
+    obj = cls.__new__(cls)
+    import collections
+    collections.OrderedDict.__init__(obj)
+    for k, v in zip(keys, children):
+        object.__setattr__(obj, k, v)
+        obj[k] = v
+    return obj
+
+jax.tree_util.register_pytree_node(
+    modeling_outputs.BaseModelOutputWithPastAndCrossAttentions,
+    _flatten_model_output,
+    _unflatten_model_output,
+)
+
+jax.tree_util.register_pytree_node(
+    diffusers_vae.DecoderOutput,
+    _flatten_model_output,
+    _unflatten_model_output,
+)
+
+jax.tree_util.register_pytree_node(
+    diffusers_modeling_outputs.AutoencoderKLOutput,
+    _flatten_model_output,
+    _unflatten_model_output,
+)
+
+def _flatten_diagonal_gaussian_distribution(
+    obj: diffusers_vae.DiagonalGaussianDistribution,
+):
+    return (
+        obj.parameters, obj.mean, obj.logvar,
+        obj.deterministic, obj.std, obj.var,
+    ), None
+
+def _unflatten_diagonal_gaussian_distribution(
+    aux, children
+) -> diffusers_vae.DiagonalGaussianDistribution:
+    obj = object.__new__(diffusers_vae.DiagonalGaussianDistribution)
+    obj.parameters = children[0]
+    obj.mean = children[1]
+    obj.logvar = children[2]
+    obj.deterministic = children[3]
+    obj.std = children[4]
+    obj.var = children[5]
+    return obj
+
+jax.tree_util.register_pytree_node(
+    diffusers_vae.DiagonalGaussianDistribution,
+    _flatten_diagonal_gaussian_distribution,
+    _unflatten_diagonal_gaussian_distribution,
+)
+
+
+class Args(argparse.Namespace):
+    size: str
+    frame_num: int
+    prompt: str
+    base_seed: int
+    sample_steps: int
+    print_weights: bool
+    profile: str
+    profile_output_path: str
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Generate a video from a text prompt using Wan T2V"
+    )
+    parser.add_argument(
+        "--size",
+        type=str,
+        default="720*1280",
+        choices=list(SIZE_CONFIGS.keys()),
+        help="The (width*height) dimensions of the generated video.",
+    )
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=1,
+        help="Number of videos to generate in a single batch."
+    )
+    parser.add_argument(
+        "--frame_num",
+        type=int,
+        default=81,
+        help="How many frames of video are generated. The number should be 4n+1",
+    )
+    parser.add_argument(
+        "--prompt",
+        type=str,
+        default=DEFAULT_PROMPT,
+        help="The prompt to generate the video from.",
+    )
+    parser.add_argument(
+        "--base_seed",
+        type=int,
+        default=0,
+        help="The seed to use for generating the video. Need to specify for multi-host sync.",
+    )
+    parser.add_argument(
+        "--sample_steps", type=int, default=40, help="The sampling steps."
+    )
+    parser.add_argument(
+        "--print_weights", action="store_true", help="print weights in models"
+    )
+    parser.add_argument(
+        "--profile",
+        type=str,
+        default="no",
+        choices=["no", "dit", "all"],
+        help="no for no profile, dit for dit only 3 steps, all including vae",
+    )
+    parser.add_argument(
+        "--profile_output_path",
+        type=str,
+        default=DEFAULT_PROFILE_OUT_PATH,
+        help="path to save profile output",
+    )
+    parser.add_argument(
+        "--dp",
+        type=int,
+        default=2,
+        help="Data parallelism for positive prompt and negative prompt.",
+    )
+    
+    parser.add_argument("--bq", type=int, default=2048, help="Query block size for Splash Attention")
+    parser.add_argument("--bkv", type=int, default=2048, help="KV block size for Splash Attention")
+    parser.add_argument("--bkv_compute", type=int, default=1024, help="Compute block size for Splash Attention")
+    parser.add_argument("--bkv_compute_in", type=int, default=1024, help="Input block size for Splash Attention")
+
+    return parser.parse_args(namespace=Args())
+
+from diffusers.models.autoencoders.autoencoder_kl_wan import WanCausalConv3d, patchify
+
+class WanVAEEncodeWrapper(torch.nn.Module):
+    def __init__(self, vae):
+        super().__init__()
+        self.encoder = vae.encoder
+        self.quant_conv = vae.quant_conv
+        self.patch_size = vae.config.patch_size
+        self.use_tiling = vae.use_tiling
+        self.tile_sample_min_width = vae.tile_sample_min_width
+        self.tile_sample_min_height = vae.tile_sample_min_height
+        
+        # Pre-count the causal convs
+        self.conv_num = sum(isinstance(m, WanCausalConv3d) for m in self.encoder.modules())
+
+    def forward(self, x):
+        batch_size, num_channels, num_frame, height, width = x.shape
+        
+        if self.patch_size is not None:
+            x = patchify(x, patch_size=self.patch_size)
+
+        feat_map = [None] * self.conv_num
+        
+        iter_ = 1 + (num_frame - 1) // 4
+        
+        # Unroll logic statically or dynamically
+        # Since num_frame is fixed in compiled graphs typically, a dynamic loop is fine for torchax if tracing allows
+        # But we can also keep it as is if tracing unrolls it automatically
+        for i in range(iter_):
+            if i == 0:
+                out, feat_map = self.encoder(x[:, :, :1, :, :], feat_cache=feat_map)
+            else:
+                out_, feat_map = self.encoder(
+                    x[:, :, 1 + 4 * (i - 1) : 1 + 4 * i, :, :],
+                    feat_cache=feat_map,
+                )
+                out = torch.cat([out, out_], 2)
+                
+        enc = self.quant_conv(out)
+        return enc
+
+class WanVAEDecodeWrapper(torch.nn.Module):
+    def __init__(self, vae):
+        super().__init__()
+        # Nest the necessary modules so torchax can trace them
+        self.decoder = vae.decoder
+        self.post_quant_conv = vae.post_quant_conv
+        self.patch_size = vae.config.patch_size
+        
+        # Pre-count the causal convs to initialize the correct cache size
+        self.conv_num = sum(isinstance(m, WanCausalConv3d) for m in self.decoder.modules())
+
+    def forward(self, z):
+        x = self.post_quant_conv(z)
+        feat_map = [None] * self.conv_num
+        
+        # CHUNK 1: Prime the cache inside the XLA graph
+        out_0, feat_map = self.decoder(
+            x[:, :, 0:1, :, :], 
+            feat_cache=feat_map, 
+            first_chunk=True
+        )
+        
+        # CHUNK 2: Process the rest (uses the cache directly from TPU memory!)
+        out_rest, _ = self.decoder(
+            x[:, :, 1:, :, :], 
+            feat_cache=feat_map, 
+            first_chunk=False
+        )
+        
+        out = torch.cat([out_0, out_rest], dim=2)
+        
+        # Unpatchify directly in the compiled graph
+        if self.patch_size is not None:
+            patch_size = self.patch_size
+            batch_size, c_patches, frames, height, width = out.shape
+            channels = c_patches // (patch_size * patch_size)
+            out = out.view(batch_size, channels, patch_size, patch_size, frames, height, width)
+            out = out.permute(0, 1, 4, 5, 3, 6, 2).contiguous()
+            out = out.view(batch_size, channels, frames, height * patch_size, width * patch_size)
+
+        return torch.clamp(out, min=-1.0, max=1.0)
+
+class WanCFGWrapper(torch.nn.Module):
+    def __init__(self, model):
+        super().__init__()
+        self.transformer = model
+        self.config = model.config
+        self.dtype = model.dtype
+
+    def forward(self, hidden_states, timestep, encoder_hidden_states, guidance_scale, rotary_emb=None, projected_text=False, projected_image=False, **kwargs):
+        # Run the batch=2 forward pass
+        batch_noise = self.transformer(
+            hidden_states=hidden_states,
+            timestep=timestep,
+            encoder_hidden_states=encoder_hidden_states,
+            return_dict=False,
+            rotary_emb=rotary_emb,         # <--- ADD THIS
+            projected_text=projected_text, # <--- ADD THIS
+            projected_image=projected_image,
+            **kwargs
+        )[0]
+        
+        # XLA fuses this math directly into the TPU graph!
+        noise_pred, noise_uncond = batch_noise.chunk(2)
+        return noise_uncond + guidance_scale * (noise_pred - noise_uncond)
+
+class WanSchedulerStepWrapper(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, sample, noise_pred, sigma, sigma_next):
+        # Pure Flow Matching / Euler discrete step math
+        # XLA will fuse this into a single lightning-fast operation
+        dt = sigma_next - sigma
+        prev_sample = sample + noise_pred * dt
+        return prev_sample
+
+def main(args: Args):
+    global BQSIZE, BKVSIZE, BKVCOMPUTESIZE, BKVCOMPUTEINSIZE
+    BQSIZE = args.bq
+    BKVSIZE = args.bkv
+    BKVCOMPUTESIZE = args.bkv_compute
+    BKVCOMPUTEINSIZE = args.bkv_compute_in
+    torch.set_default_dtype(torch.bfloat16)
+
+    model_id = "Wan-AI/Wan2.2-I2V-A14B-Diffusers" 
+    dtype = torch.bfloat16
+
+    with perf_time("load pipe"):
+        pipe = WanImageToVideoPipeline.from_pretrained(model_id, torch_dtype=dtype, boundary_ratio=0.875)
+
+    if args.print_weights:
+        print("text_encoder_shardings = ", end="")
+        _print_weights(pipe.text_encoder)
+        print()
+        print("transformer_shardings = ", end="")
+        _print_weights(pipe.transformer)
+        print()
+        print("vae_encoder_shardings = ", end="")
+        _print_weights(pipe.vae.encoder)
+        print()
+        print("vae_decoder_shardings = ", end="")
+        _print_weights(pipe.vae.decoder)
+        print()
+
+    torchax.enable_globally()
+    env = torchax.default_env()
+    assert isinstance(env, torchax.tensor.Environment)
+
+    dp_dim = args.dp
+    assert len(jax.devices()) % dp_dim == 0
+    tp_dim = len(jax.devices()) // dp_dim
+    mesh_devices = mesh_utils.create_device_mesh(
+        (dp_dim, tp_dim), allow_split_physical_axes=True
+    )
+    mesh = Mesh(mesh_devices, ("dp", "tp"))
+    print(f"{mesh=}")
+    pipe.mesh = mesh
+    
+    _overide_op_definition(
+        env, torch.nn.functional.conv2d, functools.partial(_torch_conv2d, env=env)
+    )
+    _overide_op_definition(
+        env,
+        torch.nn.functional.scaled_dot_product_attention,
+        functools.partial(_scaled_dot_product_attention, env=env, mesh=mesh),
+    )
+
+    with perf_time("Move model to tpu"):
+        with perf_time("  Move text encoder"):
+            _move_module(env, pipe.text_encoder)
+            compiled_text_encoder = torchax.compile(pipe.text_encoder)
+            compiled_text_encoder.params = _shard_weight_dict(
+                compiled_text_encoder.params, TEXT_ENCODER_SHARDINGS, mesh
+            )
+            compiled_text_encoder.buffers = _shard_weight_dict(
+                compiled_text_encoder.buffers, TEXT_ENCODER_SHARDINGS, mesh
+            )
+            
+            class TextEncoderShardingWrapper:
+                def __init__(self, compiled_encoder):
+                    self.compiled_encoder = compiled_encoder
+                    self.dtype = compiled_encoder.dtype
+                    
+                def __call__(self, input_ids, attention_mask=None, **kwargs):
+                    j_input_ids, j_attention_mask = env.t2j_iso((input_ids, attention_mask))
+                    
+                    if j_input_ids.shape[0] > 1 and j_input_ids.shape[0] % dp_dim == 0:
+                        sharding = NamedSharding(mesh, P('dp', None))
+                        j_input_ids = jax.device_put(j_input_ids, sharding)
+                        if j_attention_mask is not None:
+                            j_attention_mask = jax.device_put(j_attention_mask, sharding)
+                            
+                    t_input_ids, t_attention_mask = env.j2t_iso((j_input_ids, j_attention_mask))
+                    return self.compiled_encoder(t_input_ids, attention_mask=t_attention_mask, **kwargs)
+
+            pipe.text_encoder = TextEncoderShardingWrapper(compiled_text_encoder)
+            
+        transformer_options = torchax.CompileOptions(
+            jax_jit_kwargs={"static_argnames": ("return_dict", "projected_text")}
+        )
+        
+        class TransformerShardingWrapper:
+            def __init__(self, compiled_transformer, original_module):
+                self.compiled_transformer = compiled_transformer
+                self.original_module = original_module
+                self.dtype = compiled_transformer.dtype
+                self.config = compiled_transformer.config
+            
+            # 2. Expose the specific submodules for the pipeline to use
+            @property
+            def rope(self):
+                return self.original_module.transformer.rope
+        
+            @property
+            def condition_embedder(self):
+                return self.original_module.transformer.condition_embedder
+
+            def __call__(self, **kwargs):
+                hidden_states = kwargs.get('hidden_states')
+                timestep = kwargs.get('timestep')
+                encoder_hidden_states = kwargs.get('encoder_hidden_states')
+                encoder_hidden_states_image = kwargs.get('encoder_hidden_states_image')
+                
+                t2j_inputs = (hidden_states, timestep, encoder_hidden_states)
+                if encoder_hidden_states_image is not None:
+                    t2j_inputs += (encoder_hidden_states_image,)
+                
+                j_tensors = env.t2j_iso(t2j_inputs)
+                j_hidden_states, j_timestep, j_encoder_hidden_states = j_tensors[:3]
+                j_encoder_hidden_states_image = j_tensors[3] if len(j_tensors) > 3 else None
+                
+                if j_hidden_states is not None and j_hidden_states.shape[0] > 1 and j_hidden_states.shape[0] % dp_dim == 0:
+                    sharding = NamedSharding(mesh, P('dp', *([None] * (j_hidden_states.ndim - 1))))
+                    j_hidden_states = jax.device_put(j_hidden_states, sharding)
+                    
+                    sharding_ts = NamedSharding(mesh, P('dp', *([None] * (j_timestep.ndim - 1))))
+                    j_timestep = jax.device_put(j_timestep, sharding_ts)
+                    
+                    sharding_enc = NamedSharding(mesh, P('dp', *([None] * (j_encoder_hidden_states.ndim - 1))))
+                    j_encoder_hidden_states = jax.device_put(j_encoder_hidden_states, sharding_enc)
+                    
+                    if j_encoder_hidden_states_image is not None:
+                        sharding_enc_img = NamedSharding(mesh, P('dp', *([None] * (j_encoder_hidden_states_image.ndim - 1))))
+                        j_encoder_hidden_states_image = jax.device_put(j_encoder_hidden_states_image, sharding_enc_img)
+                        
+                t_tensors = env.j2t_iso(j_tensors)
+                t_hidden_states, t_timestep, t_encoder_hidden_states = t_tensors[:3]
+                t_encoder_hidden_states_image = t_tensors[3] if len(t_tensors) > 3 else None
+                
+                new_kwargs = kwargs.copy()
+                guidance_scale = new_kwargs.pop('guidance_scale', 5.0) 
+                rotary_emb = new_kwargs.pop('rotary_emb', None)
+                if rotary_emb is not None:
+                    new_kwargs['rotary_emb'] = rotary_emb
+
+                if hidden_states is not None: new_kwargs['hidden_states'] = t_hidden_states
+                if timestep is not None: new_kwargs['timestep'] = t_timestep
+                if encoder_hidden_states is not None: new_kwargs['encoder_hidden_states'] = t_encoder_hidden_states
+                if encoder_hidden_states_image is not None: new_kwargs['encoder_hidden_states_image'] = t_encoder_hidden_states_image
+                
+                new_kwargs['guidance_scale'] = float(guidance_scale)
+                
+                return self.compiled_transformer(**new_kwargs)
+
+        with perf_time("  Move transformer"):
+            # Strip Dropout for Identity to clean the XLA graph
+            for block in pipe.transformer.blocks:
+                block.attn1.to_out[1] = torch.nn.Identity()
+                block.attn2.to_out[1] = torch.nn.Identity()
+
+            wrapped_transformer = WanCFGWrapper(pipe.transformer)
+            _move_module(env, wrapped_transformer)
+            compiled_transformer = torchax.compile(wrapped_transformer, transformer_options)
+            compiled_transformer.params = _shard_weight_dict(
+                compiled_transformer.params, TRANSFORMER_SHARDINGS, mesh
+            )
+            compiled_transformer.buffers = _shard_weight_dict(
+                compiled_transformer.buffers, TRANSFORMER_SHARDINGS, mesh
+            )
+            pipe.transformer = TransformerShardingWrapper(compiled_transformer, wrapped_transformer)
+
+        with perf_time("  Move transformer2"):
+            if getattr(pipe, "transformer_2", None) is not None:
+                # Strip Dropout for Identity
+                for block in pipe.transformer_2.blocks:
+                    block.attn1.to_out[1] = torch.nn.Identity()
+                    block.attn2.to_out[1] = torch.nn.Identity()
+
+                wrapped_transformer_2 = WanCFGWrapper(pipe.transformer_2)
+                _move_module(env, wrapped_transformer_2)
+                compiled_transformer_2 = torchax.compile(
+                    wrapped_transformer_2, transformer_options
+                )
+                compiled_transformer_2.params = _shard_weight_dict(
+                    compiled_transformer_2.params, TRANSFORMER_SHARDINGS, mesh
+                )
+                compiled_transformer_2.buffers = _shard_weight_dict(
+                    compiled_transformer_2.buffers, TRANSFORMER_SHARDINGS, mesh
+                )
+                pipe.transformer_2 = TransformerShardingWrapper(compiled_transformer_2, wrapped_transformer_2)
+
+        with perf_time("  Move scheduler"):
+            # 1. Instantiate our new wrapper
+            wrapped_scheduler = WanSchedulerStepWrapper()
+            _move_module(env, wrapped_scheduler)
+            
+            # 2. Compile it
+            compiled_scheduler = torchax.compile(wrapped_scheduler)
+            
+            # 3. Handle empty parameter dictionaries for the compiler API
+            compiled_scheduler.params = _shard_weight_dict(compiled_scheduler.params, {}, mesh)
+            compiled_scheduler.buffers = _shard_weight_dict(compiled_scheduler.buffers, {}, mesh)
+            
+            # 4. Create the Sharding Wrapper to manage the XLA boundary
+            class SchedulerShardingWrapper:
+                def __init__(self, compiled_sched):
+                    self.compiled_sched = compiled_sched
+                    
+                def __call__(self, sample, noise_pred, sigma, sigma_next):
+                    # Convert the float sigmas to tensors so XLA doesn't recompile on every step
+                    t_sigma = torch.tensor(sigma, dtype=sample.dtype)
+                    t_sigma_next = torch.tensor(sigma_next, dtype=sample.dtype)
+                    
+                    j_sample, j_noise_pred, j_sigma, j_sigma_next = env.t2j_iso(
+                        (sample, noise_pred, t_sigma, t_sigma_next)
+                    )
+                    
+                    # Enforce Data Parallelism on the massive latents
+                    if j_sample.shape[0] > 1 and j_sample.shape[0] % dp_dim == 0:
+                        sharding = NamedSharding(mesh, P('dp', *([None] * (j_sample.ndim - 1))))
+                        j_sample = jax.device_put(j_sample, sharding)
+                        j_noise_pred = jax.device_put(j_noise_pred, sharding)
+                        
+                    t_sample, t_noise_pred, t_sigma, t_sigma_next = env.j2t_iso(
+                        (j_sample, j_noise_pred, j_sigma, j_sigma_next)
+                    )
+                    
+                    return self.compiled_sched(t_sample, t_noise_pred, t_sigma, t_sigma_next)
+                    
+            # Attach it directly to the pipeline object
+            pipe.compiled_scheduler_step = SchedulerShardingWrapper(compiled_scheduler)
+
+        with perf_time("  Move vae"):
+            _move_module(env, pipe.vae)
+
+            # 1. Wrap the VAE encoder logic
+            wrapped_vae_encoder = WanVAEEncodeWrapper(pipe.vae)
+            
+            # 2. Compile the whole chunking process as one XLA graph
+            compiled_vae_encoder = torchax.compile(wrapped_vae_encoder)
+            
+            # 3. Shard as normal
+            compiled_vae_encoder.params = _shard_weight_dict(compiled_vae_encoder.params, VAE_ENCODER_SHARDINGS, mesh)
+            compiled_vae_encoder.buffers = _shard_weight_dict(compiled_vae_encoder.buffers, VAE_ENCODER_SHARDINGS, mesh)
+            
+            # 4. Override the pipeline's encode method
+            def custom_vae_encode(x, return_dict=False):
+                # Ensure it enters the compiled graph directly
+                from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
+                from diffusers.models.modeling_outputs import AutoencoderKLOutput
+                
+                out = compiled_vae_encoder(x)
+                posterior = DiagonalGaussianDistribution(out)
+                if not return_dict:
+                    return (posterior,)
+                return AutoencoderKLOutput(latent_dist=posterior)
+                
+            pipe.vae.encode = custom_vae_encode
+
+            # 1. Wrap the VAE decoder logic
+            wrapped_vae_decoder = WanVAEDecodeWrapper(pipe.vae)
+            
+            # 2. Compile the whole chunking process as one XLA graph
+            compiled_vae_decoder = torchax.compile(wrapped_vae_decoder)
+            
+            # 3. Shard as normal (Defaults to P() since VAE_DECODER_SHARDINGS is empty)
+            compiled_vae_decoder.params = _shard_weight_dict(compiled_vae_decoder.params, VAE_DECODER_SHARDINGS, mesh)
+            compiled_vae_decoder.buffers = _shard_weight_dict(compiled_vae_decoder.buffers, VAE_DECODER_SHARDINGS, mesh)
+            
+            # 4. Override the pipeline's decode method to use our compiled graph directly!
+            def custom_vae_decode(z, return_dict=False):
+                out = compiled_vae_decoder(z)
+                if not return_dict:
+                    return (out,)
+                return DecoderOutput(sample=out)
+                
+            pipe.vae.decode = custom_vae_decode
+
+
+    raw_width, raw_height = SIZE_CONFIGS[args.size]
+    
+    mod_value = pipe.vae_scale_factor_spatial * pipe.transformer.config.patch_size[1]
+    height = (raw_height // mod_value) * mod_value
+    width = (raw_width // mod_value) * mod_value
+
+    image = load_image(args.image)
+    image = image.resize((width, height))
+
+    prompt = args.prompt
+    negative_prompt = DEFAULT_NEG_PROMPT
+    generator = torch.Generator().manual_seed(args.base_seed)
+    
+    guidance_low = 3
+    guidance_high = 4
+    with mesh:
+        with perf_time("Warmup and output video"):
+            output = pipe(
+                image=image,
+                prompt=prompt,
+                negative_prompt=negative_prompt,
+                height=height,
+                width=width,
+                num_frames=args.frame_num,
+                guidance_scale=guidance_high,
+                guidance_scale_2=guidance_low,
+                num_inference_steps=args.sample_steps,
+                generator=generator,
+                max_sequence_length=256,
+            ).frames[0]
+            
+            current_datetime = datetime.now().strftime("%Y%m%d_%H%M%S")
+            file_name = f"{current_datetime}_batch_0.mp4"
+            export_to_video(output, file_name, fps=16)
+            print(f"output video done. {file_name}")
+
+        if args.profile != "no":
+            with perf_time("Profile"):
+                output_type = "latent" if args.profile == "dit" else "np"
+                
+                with jax.profiler.trace(args.profile_output_path):
+                    output = pipe(
+                        image=image,
+                        prompt=prompt,
+                        negative_prompt=negative_prompt,
+                        height=height,
+                        width=width,
+                        num_frames=args.frame_num,
+                        guidance_scale=guidance_high,
+                        guidance_scale_2=guidance_low,
+                        num_inference_steps=3,
+                        generator=generator,
+                        max_sequence_length=256,
+                        output_type=output_type,
+                    ).frames[0]
+
+        with perf_time("Benchmark"):
+            output = pipe(
+                image=image,
+                prompt=prompt,
+                negative_prompt=negative_prompt,
+                height=height,
+                width=width,
+                num_frames=args.frame_num,
+                guidance_scale=guidance_high,
+                guidance_scale_2=guidance_low,
+                num_inference_steps=args.sample_steps,
+                generator=generator,
+                max_sequence_length=256,
+            ).frames[0]
+
+    print("Done")
+
+if __name__ == "__main__":
+    args = parse_args()
+    print(args)
+    main(args)
