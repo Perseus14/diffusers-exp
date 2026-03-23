@@ -35,6 +35,11 @@ export LIBTPU_INIT_ARGS='--xla_tpu_dvfs_p_state=7 \
 --xla_tpu_strict_fp32_to_bf16_conversion=false \
 --xla_tpu_use_enhanced_fp32_for_bf16_conversions=true \
 --xla_tpu_enable_latency_hiding_scheduler=true \
+--xla_tpu_all_reduce_combine_threshold_bytes=1073741824 \
+--xla_tpu_all_gather_combine_threshold_bytes=1073741824 \
+--xla_tpu_reduce_scatter_combine_threshold_bytes=1073741824 \
+--xla_tpu_enable_fast_collective_permute=true \
+--xla_tpu_latency_hiding_scheduler_rerun_with_more_overlap_opportunities=true \
 --xla_tpu_assign_all_reduce_scatter_layout=true' && \
 export HF_HUB_CACHE=/dev/shm/maxdiffusion_hf_cache/ && \
 export HF_HUB_ENABLE_HF_TRANSFER=1 && \

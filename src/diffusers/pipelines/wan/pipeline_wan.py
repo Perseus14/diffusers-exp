@@ -29,7 +29,6 @@ from ...video_processor import VideoProcessor
 from ..pipeline_utils import DiffusionPipeline
 from .pipeline_output import WanPipelineOutput
 
-
 import jax
 import jax.numpy as jnp
 from jax.sharding import NamedSharding, PartitionSpec as P
@@ -602,9 +601,38 @@ class WanPipeline(DiffusionPipeline, WanLoraLoaderMixin):
             t_freqs_cos, t_freqs_sin = env.j2t_iso((j_freqs_cos, j_freqs_sin))
             static_rotary_emb = (t_freqs_cos, t_freqs_sin)
 
+            # 2. Pre-project text embeddings
             prompt_embeds = transformer_model.condition_embedder.text_embedder(prompt_embeds)
             if negative_prompt_embeds is not None:
                 negative_prompt_embeds = transformer_model.condition_embedder.text_embedder(negative_prompt_embeds)
+
+            # 3. GENERATE THE CROSS-ATTN KV CACHE ON TPU
+            j_prompt_embeds = env.t2j_iso(prompt_embeds)
+            j_neg_embeds = env.t2j_iso(negative_prompt_embeds) if negative_prompt_embeds is not None else None
+            
+            # Combine pos and neg prompts for the batch=2 forward pass
+            if j_neg_embeds is not None:
+                j_batch_text = jnp.concatenate([j_prompt_embeds, j_neg_embeds], axis=0)
+            else:
+                j_batch_text = j_prompt_embeds
+
+            text_sharding = NamedSharding(mesh, P('dp', None, None))
+            j_batch_text = jax.device_put(j_batch_text, text_sharding)
+            j_batch_text_t = env.j2t_iso(j_batch_text) # Prepare the Torchax View once
+
+            # --- Cache 1 (High-Noise Expert) ---
+            flat_cache_j_1 = self.compiled_cache_generator(j_batch_text_t)
+            static_kv_cache_1 = []
+            for idx in range(0, len(flat_cache_j_1), 2):
+                static_kv_cache_1.append((flat_cache_j_1[idx], flat_cache_j_1[idx+1]))
+
+            # --- Cache 2 (Low-Noise Expert) ---
+            static_kv_cache_2 = None
+            if getattr(self, "compiled_cache_generator_2", None) is not None:
+                flat_cache_j_2 = self.compiled_cache_generator_2(j_batch_text_t)
+                static_kv_cache_2 = []
+                for idx in range(0, len(flat_cache_j_2), 2):
+                    static_kv_cache_2.append((flat_cache_j_2[idx], flat_cache_j_2[idx+1]))
 
         # 6. Denoising loop
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
@@ -626,10 +654,12 @@ class WanPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                     # wan2.1 or high-noise stage in wan2.2
                     current_model = self.transformer
                     current_guidance_scale = guidance_scale
+                    current_kv_cache = static_kv_cache_1
                 else:
                     # low-noise stage in wan2.2
                     current_model = self.transformer_2
                     current_guidance_scale = guidance_scale_2
+                    current_kv_cache = static_kv_cache_2
 
                 latent_model_input = latents.to(transformer_dtype)
                 if self.config.expand_timesteps:
@@ -639,27 +669,7 @@ class WanPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                     timestep = temp_ts.unsqueeze(0).expand(latents.shape[0], -1)
                 else:
                     timestep = t.expand(latents.shape[0])
-                ''' 
-                with current_model.cache_context("cond"):
-                    noise_pred = current_model(
-                        hidden_states=latent_model_input,
-                        timestep=timestep,
-                        encoder_hidden_states=prompt_embeds,
-                        attention_kwargs=attention_kwargs,
-                        return_dict=False,
-                    )[0]
-
-                if self.do_classifier_free_guidance:
-                    with current_model.cache_context("uncond"):
-                        noise_uncond = current_model(
-                            hidden_states=latent_model_input,
-                            timestep=timestep,
-                            encoder_hidden_states=negative_prompt_embeds,
-                            attention_kwargs=attention_kwargs,
-                            return_dict=False,
-                        )[0]
-                    noise_pred = noise_uncond + current_guidance_scale * (noise_pred - noise_uncond)
-                '''
+                
                 if self.do_classifier_free_guidance:
                     batch_latent_model_input = torch.cat([latent_model_input, latent_model_input])
                     batch_timestep = torch.cat([timestep, timestep])
@@ -677,10 +687,8 @@ class WanPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                     attention_kwargs=attention_kwargs,
                     rotary_emb=static_rotary_emb,       # <--- ADD THIS
                     projected_text=True,
+                    cross_attn_kv_cache=current_kv_cache, # <--- FEED THE CACHE
                 )
-
-                # compute the previous noisy sample x_t -> x_t-1
-                #latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
 
                 # compute the previous noisy sample x_t -> x_t-1
                 if hasattr(self, "compiled_scheduler_step"):
@@ -741,4 +749,3 @@ class WanPipeline(DiffusionPipeline, WanLoraLoaderMixin):
             return (video,)
 
         return WanPipelineOutput(frames=video)
-

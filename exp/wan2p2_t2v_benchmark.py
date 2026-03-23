@@ -78,34 +78,6 @@ TEXT_ENCODER_SHARDINGS = {
     'encoder.block.*.layer.*.DenseReluDense.wo.weight': (None, 'tp',), 
 }
 
-'''
-# Added 'transformer.' prefix to all keys since the model is now wrapped in WanCFGWrapper
-TRANSFORMER_SHARDINGS = {
-    'transformer.condition_embedder.time_embedder.linear_1.weight': ('tp',),
-    'transformer.condition_embedder.time_embedder.linear_1.bias': ('tp',),
-    'transformer.condition_embedder.time_embedder.linear_2.weight': (None, 'tp',),
-    'transformer.condition_embedder.text_embedder.linear_1.weight': ('tp',),
-    'transformer.condition_embedder.text_embedder.linear_1.bias': ('tp',),
-    'transformer.condition_embedder.text_embedder.linear_2.weight': (None, 'tp',),
-    'transformer.blocks.*.attn1.to_q.weight': ('tp',),
-    'transformer.blocks.*.attn1.to_q.bias': ('tp',),
-    'transformer.blocks.*.attn1.to_k.weight': ('tp',),
-    'transformer.blocks.*.attn1.to_k.bias': ('tp',),
-    'transformer.blocks.*.attn1.to_v.weight': ('tp',),
-    'transformer.blocks.*.attn1.to_v.bias': ('tp',),
-    'transformer.blocks.*.attn1.to_out.*.weight': (None, 'tp',), # Kept .* because it is a ModuleList with Identity
-    'transformer.blocks.*.attn2.to_q.weight': ('tp',),
-    'transformer.blocks.*.attn2.to_q.bias': ('tp',),
-    'transformer.blocks.*.attn2.to_k.weight': ('tp',),
-    'transformer.blocks.*.attn2.to_k.bias': ('tp',),
-    'transformer.blocks.*.attn2.to_v.weight': ('tp',),
-    'transformer.blocks.*.attn2.to_v.bias': ('tp',),
-    'transformer.blocks.*.attn2.to_out.*.weight': (None, 'tp',), # Kept .* because it is a ModuleList with Identity
-    'transformer.blocks.*.ffn.net.*.proj.weight': ('tp',),
-    'transformer.blocks.*.ffn.net.*.proj.bias': ('tp',),
-    'transformer.blocks.*.ffn.net.*.weight': (None, 'tp',),
-}
-'''
 TRANSFORMER_SHARDINGS = {
     # ---------------------------------------------------------
     # 1. Condition Embedders (Time & Text)
@@ -141,7 +113,6 @@ TRANSFORMER_SHARDINGS = {
     'transformer.blocks.*.attn2.to_v.bias': ('tp',),
 
     # Output Projections (Row Parallel: Shard in_features)
-    # Note: Using .0. because your code shows a ModuleList with Identity at .1.
     'transformer.blocks.*.attn1.to_out.0.weight': (None, 'tp',),
     'transformer.blocks.*.attn1.to_out.0.bias': (None,), # Replicated: added AFTER the ICI All-Reduce
     'transformer.blocks.*.attn2.to_out.0.weight': (None, 'tp',),
@@ -527,6 +498,34 @@ class WanVAEDecodeWrapper(torch.nn.Module):
 
         return torch.clamp(out, min=-1.0, max=1.0)
 
+
+# =========================================================================
+# NEW: Cross-Attention KV Cache Generator
+# =========================================================================
+class WanCrossAttnCacheGenerator(torch.nn.Module):
+    def __init__(self, transformer):
+        super().__init__()
+        # CRITICAL: We map 'self.transformer' to match the TRANSFORMER_SHARDINGS dict
+        self.transformer = transformer 
+
+    def forward(self, encoder_hidden_states):
+        kv_cache = []
+        for block in self.transformer.blocks:
+            attn = block.attn2
+            k = attn.to_k(encoder_hidden_states)
+            v = attn.to_v(encoder_hidden_states)
+            k = attn.norm_k(k)
+            
+            k = k.unflatten(2, (attn.heads, -1))
+            v = v.unflatten(2, (attn.heads, -1))
+            
+            kv_cache.append(k)
+            kv_cache.append(v)
+        # Return flat tuple for Torchax compatibility
+        return tuple(kv_cache)
+# =========================================================================
+
+
 class WanCFGWrapper(torch.nn.Module):
     def __init__(self, model):
         super().__init__()
@@ -534,15 +533,16 @@ class WanCFGWrapper(torch.nn.Module):
         self.config = model.config
         self.dtype = model.dtype
 
-    def forward(self, hidden_states, timestep, encoder_hidden_states, guidance_scale, rotary_emb=None, projected_text=False, **kwargs):
+    def forward(self, hidden_states, timestep, encoder_hidden_states, guidance_scale, rotary_emb=None, projected_text=False, cross_attn_kv_cache=None, **kwargs):
         # Run the batch=2 forward pass
         batch_noise = self.transformer(
             hidden_states=hidden_states,
             timestep=timestep,
             encoder_hidden_states=encoder_hidden_states,
             return_dict=False,
-            rotary_emb=rotary_emb,         # <--- ADD THIS
-            projected_text=projected_text, # <--- ADD THIS
+            rotary_emb=rotary_emb,         
+            projected_text=projected_text, 
+            cross_attn_kv_cache=cross_attn_kv_cache, # <--- FEED THE CACHE
             **kwargs
         )[0]
         
@@ -684,6 +684,11 @@ def main(args: Args):
                 if rotary_emb is not None:
                     new_kwargs['rotary_emb'] = rotary_emb
 
+                # INTERCEPT THE KV CACHE (Pass through directly)
+                cross_attn_kv_cache = new_kwargs.pop('cross_attn_kv_cache', None)
+                if cross_attn_kv_cache is not None:
+                    new_kwargs['cross_attn_kv_cache'] = cross_attn_kv_cache
+
                 if hidden_states is not None: new_kwargs['hidden_states'] = t_hidden_states
                 if timestep is not None: new_kwargs['timestep'] = t_timestep
                 if encoder_hidden_states is not None: new_kwargs['encoder_hidden_states'] = t_encoder_hidden_states
@@ -709,6 +714,14 @@ def main(args: Args):
             )
             pipe.transformer = TransformerShardingWrapper(compiled_transformer, wrapped_transformer)
 
+        with perf_time("  Move cache generator"):
+            wrapped_cache_gen = WanCrossAttnCacheGenerator(pipe.transformer.original_module.transformer)
+            _move_module(env, wrapped_cache_gen)
+            compiled_cache_gen = torchax.compile(wrapped_cache_gen)
+            compiled_cache_gen.params = _shard_weight_dict(compiled_cache_gen.params, TRANSFORMER_SHARDINGS, mesh)
+            compiled_cache_gen.buffers = _shard_weight_dict(compiled_cache_gen.buffers, TRANSFORMER_SHARDINGS, mesh)
+            pipe.compiled_cache_generator = compiled_cache_gen
+
         with perf_time("  Move transformer2"):
             if getattr(pipe, "transformer_2", None) is not None:
                 # Strip Dropout for Identity
@@ -728,6 +741,16 @@ def main(args: Args):
                     compiled_transformer_2.buffers, TRANSFORMER_SHARDINGS, mesh
                 )
                 pipe.transformer_2 = TransformerShardingWrapper(compiled_transformer_2, wrapped_transformer_2)
+
+                # >>> NEW: Compile the second KV cache generator for transformer_2 <<<
+                wrapped_cache_gen_2 = WanCrossAttnCacheGenerator(pipe.transformer_2.original_module.transformer)
+                _move_module(env, wrapped_cache_gen_2)
+                compiled_cache_gen_2 = torchax.compile(wrapped_cache_gen_2)
+                compiled_cache_gen_2.params = _shard_weight_dict(compiled_cache_gen_2.params, TRANSFORMER_SHARDINGS, mesh)
+                compiled_cache_gen_2.buffers = _shard_weight_dict(compiled_cache_gen_2.buffers, TRANSFORMER_SHARDINGS, mesh)
+                pipe.compiled_cache_generator_2 = compiled_cache_gen_2
+            else:
+                pipe.compiled_cache_generator_2 = None
 
         with perf_time("  Move scheduler"):
             # 1. Instantiate our new wrapper

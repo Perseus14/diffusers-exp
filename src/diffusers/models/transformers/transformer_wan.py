@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import math
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -86,6 +86,7 @@ class WanAttnProcessor:
         encoder_hidden_states: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        cross_attn_kv_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
         encoder_hidden_states_img = None
         if attn.add_k_proj is not None:
@@ -94,14 +95,23 @@ class WanAttnProcessor:
             encoder_hidden_states_img = encoder_hidden_states[:, :image_context_length]
             encoder_hidden_states = encoder_hidden_states[:, image_context_length:]
 
-        query, key, value = _get_qkv_projections(attn, hidden_states, encoder_hidden_states)
+        # ---------------------------------------------------------
+        # KV CACHE SHORT-CIRCUIT
+        # ---------------------------------------------------------
+        if cross_attn_kv_cache is not None:
+            key, value = cross_attn_kv_cache
+            query = attn.to_q(hidden_states)
+            query = attn.norm_q(query)
+            query = query.unflatten(2, (attn.heads, -1))
+        else:
+            query, key, value = _get_qkv_projections(attn, hidden_states, encoder_hidden_states)
+            query = attn.norm_q(query)
+            key = attn.norm_k(key)
 
-        query = attn.norm_q(query)
-        key = attn.norm_k(key)
-
-        query = query.unflatten(2, (attn.heads, -1))
-        key = key.unflatten(2, (attn.heads, -1))
-        value = value.unflatten(2, (attn.heads, -1))
+            query = query.unflatten(2, (attn.heads, -1))
+            key = key.unflatten(2, (attn.heads, -1))
+            value = value.unflatten(2, (attn.heads, -1))
+        # ---------------------------------------------------------
 
         if rotary_emb is not None:
 
@@ -119,7 +129,10 @@ class WanAttnProcessor:
                 return out.type_as(hidden_states)
 
             query = apply_rotary_emb(query, *rotary_emb)
-            key = apply_rotary_emb(key, *rotary_emb)
+            # Only apply rotary embeddings to keys if we didn't pull them from the cache.
+            # (Cross-attention keys don't use RoPE in this architecture anyway, but it's safe)
+            if cross_attn_kv_cache is None:
+                key = apply_rotary_emb(key, *rotary_emb)
 
         # I2V task
         hidden_states_img = None
@@ -275,9 +288,18 @@ class WanAttention(torch.nn.Module, AttentionModuleMixin):
         encoder_hidden_states: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        cross_attn_kv_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         **kwargs,
     ) -> torch.Tensor:
-        return self.processor(self, hidden_states, encoder_hidden_states, attention_mask, rotary_emb, **kwargs)
+        return self.processor(
+            self, 
+            hidden_states, 
+            encoder_hidden_states, 
+            attention_mask, 
+            rotary_emb, 
+            cross_attn_kv_cache=cross_attn_kv_cache, 
+            **kwargs
+        )
 
 
 class WanImageEmbedding(torch.nn.Module):
@@ -465,6 +487,7 @@ class WanTransformerBlock(nn.Module):
         encoder_hidden_states: torch.Tensor,
         temb: torch.Tensor,
         rotary_emb: torch.Tensor,
+        cross_attn_kv_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
         if temb.ndim == 4:
             # temb: batch_size, seq_len, 6, inner_dim (wan2.2 ti2v)
@@ -491,7 +514,7 @@ class WanTransformerBlock(nn.Module):
 
         # 2. Cross-attention
         norm_hidden_states = self.norm2(hidden_states.float()).type_as(hidden_states)
-        attn_output = self.attn2(norm_hidden_states, encoder_hidden_states, None, None)
+        attn_output = self.attn2(norm_hidden_states, encoder_hidden_states, None, None, cross_attn_kv_cache=cross_attn_kv_cache)
         hidden_states = hidden_states + attn_output
 
         # 3. Feed-forward
@@ -628,8 +651,9 @@ class WanTransformer3DModel(
         encoder_hidden_states_image: Optional[torch.Tensor] = None,
         return_dict: bool = True,
         attention_kwargs: Optional[Dict[str, Any]] = None,
-        rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None, # <--- 1. ADD THIS
+        rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         projected_text: bool = False,
+        cross_attn_kv_cache: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
     ) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
         hidden_states = mark_sharding(hidden_states, P("dp"))
         encoder_hidden_states = mark_sharding(encoder_hidden_states, P("dp"))
@@ -683,13 +707,15 @@ class WanTransformer3DModel(
 
         # 4. Transformer blocks
         if torch.is_grad_enabled() and self.gradient_checkpointing:
-            for block in self.blocks:
+            for i, block in enumerate(self.blocks):
+                layer_cache = cross_attn_kv_cache[i] if cross_attn_kv_cache is not None else None
                 hidden_states = self._gradient_checkpointing_func(
-                    block, hidden_states, encoder_hidden_states, timestep_proj, rotary_emb
+                    block, hidden_states, encoder_hidden_states, timestep_proj, rotary_emb, layer_cache
                 )
         else:
-            for block in self.blocks:
-                hidden_states = block(hidden_states, encoder_hidden_states, timestep_proj, rotary_emb)
+            for i, block in enumerate(self.blocks):
+                layer_cache = cross_attn_kv_cache[i] if cross_attn_kv_cache is not None else None
+                hidden_states = block(hidden_states, encoder_hidden_states, timestep_proj, rotary_emb, cross_attn_kv_cache=layer_cache)
 
         # 5. Output norm, projection & unpatchify
         if temb.ndim == 3:
