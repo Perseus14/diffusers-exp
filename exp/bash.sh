@@ -1,7 +1,6 @@
 export JAX_COMPILATION_CACHE_DIR="/dev/shm/jax_cache" && \
 export JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES=-1 && \
 export JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS=0 && \
-export JAX_PERSISTENT_CACHE_ENABLE_XLA_CACHES='xla_gpu_per_fusion_autotune_cache_dir' && \
 export HF_HUB_CACHE=/dev/shm/hf_cache && \
 export XLA_PYTHON_CLIENT_MEM_FRACTION=0.95 && \
 export JAX_DEFAULT_MATMUL_PRECISION=bfloat16 && \
@@ -39,7 +38,10 @@ export LIBTPU_INIT_ARGS='--xla_tpu_dvfs_p_state=7 \
 --xla_tpu_reduce_scatter_combine_threshold_bytes=1073741824 \
 --xla_tpu_enable_fast_collective_permute=true \
 --xla_tpu_latency_hiding_scheduler_rerun_with_more_overlap_opportunities=true \
---xla_tpu_assign_all_reduce_scatter_layout=true' && \
+--xla_tpu_assign_all_reduce_scatter_layout=true \
+--xla_tpu_vectorize_all_reduce_scatter=true \
+--xla_tpu_dot_dimension_layout_optimization=true \
+--xla_tpu_memory_bound_loop_optimizer_options=all' && \
 export HF_HUB_CACHE=/dev/shm/maxdiffusion_hf_cache/ && \
 export HF_HUB_ENABLE_HF_TRANSFER=1 && \
 HF_HUB_CACHE=/dev/shm python wan2p2_t2v_benchmark.py --size 720*1280 --batch_size 1 --dp 2 --bq 4864 --bkv 1024 --bkv_compute 1024 --bkv_compute_in 1024 --frame_num 81

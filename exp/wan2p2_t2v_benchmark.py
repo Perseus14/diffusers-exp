@@ -241,7 +241,7 @@ def _tpu_custom_attention(query, key, value, mesh, scale=None):
         vmapped_kernel = jax.vmap(kernel_3d, in_axes=(0, 0, 0), out_axes=0)
         return vmapped_kernel(q, k, v)
 
-    if False and key.shape[0] > 1:
+    if args.FLAG and key.shape[0] > 1:
         dp_mesh_key = "dp"
         remain_mesh_key = ("tp",)
     else:
@@ -270,6 +270,18 @@ def _tpu_custom_attention(query, key, value, mesh, scale=None):
 
         q_partition_spec = P(dp_mesh_key, None, remain_mesh_key, None)
         kv_partition_spec = P(dp_mesh_key, None, None, None)
+    
+    print(f"\n{'='*20} TPU ATTENTION SHARDING DEBUG {'='*20}")
+    print(f"| {'Variable':<20} | {'Value':<40} |")
+    print(f"|{'-'*22}|{'-'*42}|")
+    print(f"| Query Seq Len      | {q_seq_len:<40} |")
+    print(f"| KV Seq Len         | {kv_seq_len:<40} |")
+    print(f"| Heads (Q/KV)       | {q_num_head:<19} / {kv_num_head:<18} |")
+    print(f"| Device Mesh Prod   | {remain_devices_prod:<40} |")
+    print(f"|{'-'*22}|{'-'*42}|")
+    print(f"| Q PartitionSpec    | {str(q_partition_spec):<40} |")
+    print(f"| KV PartitionSpec   | {str(kv_partition_spec):<40} |")
+    print(f"{'='*70}\n")
 
     sharded_fn = jax.shard_map(
         _attention_on_slices,
@@ -382,6 +394,7 @@ class Args(argparse.Namespace):
     base_seed: int
     sample_steps: int
     print_weights: bool
+    FLAG: bool
     profile: str
     profile_output_path: str
 
@@ -451,6 +464,7 @@ def parse_args():
     parser.add_argument("--bkv", type=int, default=2048, help="KV block size for Splash Attention")
     parser.add_argument("--bkv_compute", type=int, default=1024, help="Compute block size for Splash Attention")
     parser.add_argument("--bkv_compute_in", type=int, default=1024, help="Input block size for Splash Attention")
+    parser.add_argument("--FLAG", action="store_true", help="Sets head sharding")
 
     return parser.parse_args(namespace=Args())
 
