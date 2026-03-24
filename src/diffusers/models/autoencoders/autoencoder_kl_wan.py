@@ -12,8 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import List, Optional, Tuple, Union
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -25,7 +23,7 @@ from ...utils.accelerate_utils import apply_forward_hook
 from ..activations import get_activation
 from ..modeling_outputs import AutoencoderKLOutput
 from ..modeling_utils import ModelMixin
-from .vae import DecoderOutput, DiagonalGaussianDistribution
+from .vae import AutoencoderMixin, DecoderOutput, DiagonalGaussianDistribution
 
 import jax
 from torchax import interop
@@ -154,9 +152,9 @@ class WanCausalConv3d(nn.Conv3d):
         self,
         in_channels: int,
         out_channels: int,
-        kernel_size: Union[int, Tuple[int, int, int]],
-        stride: Union[int, Tuple[int, int, int]] = 1,
-        padding: Union[int, Tuple[int, int, int]] = 0,
+        kernel_size: int | tuple[int, int, int],
+        stride: int | tuple[int, int, int] = 1,
+        padding: int | tuple[int, int, int] = 0,
     ) -> None:
         super().__init__(
             in_channels=in_channels,
@@ -227,7 +225,14 @@ class WanRMS_norm(nn.Module):
         self.bias = nn.Parameter(torch.zeros(shape)) if bias else 0.0
 
     def forward(self, x):
-        return F.normalize(x, dim=(1 if self.channel_first else -1)) * self.scale * self.gamma + self.bias
+        needs_fp32_normalize = x.dtype in (torch.float16, torch.bfloat16) or any(
+            t in str(x.dtype) for t in ("float4_", "float8_")
+        )
+        normalized = F.normalize(x.float() if needs_fp32_normalize else x, dim=(1 if self.channel_first else -1)).to(
+            x.dtype
+        )
+
+        return normalized * self.scale * self.gamma + self.bias
 
 
 class WanUpsample(nn.Upsample):
@@ -760,7 +765,7 @@ class WanUpBlock(nn.Module):
         out_dim: int,
         num_res_blocks: int,
         dropout: float = 0.0,
-        upsample_mode: Optional[str] = None,
+        upsample_mode: str | None = None,
         non_linearity: str = "silu",
     ):
         super().__init__()
@@ -987,7 +992,7 @@ def unpatchify(x, patch_size):
     return x
 
 
-class AutoencoderKLWan(ModelMixin, ConfigMixin, FromOriginalModelMixin):
+class AutoencoderKLWan(ModelMixin, AutoencoderMixin, ConfigMixin, FromOriginalModelMixin):
     r"""
     A VAE model with KL loss for encoding videos into latents and decoding latent representations into videos.
     Introduced in [Wan 2.1].
@@ -997,19 +1002,23 @@ class AutoencoderKLWan(ModelMixin, ConfigMixin, FromOriginalModelMixin):
     """
 
     _supports_gradient_checkpointing = False
+    _group_offload_block_modules = ["quant_conv", "post_quant_conv", "encoder", "decoder"]
+    # keys toignore when AlignDeviceHook moves inputs/outputs between devices
+    # these are shared mutable state modified in-place
+    _skip_keys = ["feat_cache", "feat_idx"]
 
     @register_to_config
     def __init__(
         self,
         base_dim: int = 96,
-        decoder_base_dim: Optional[int] = None,
+        decoder_base_dim: int | None = None,
         z_dim: int = 16,
-        dim_mult: Tuple[int] = [1, 2, 4, 4],
+        dim_mult: list[int] = [1, 2, 4, 4],
         num_res_blocks: int = 2,
-        attn_scales: List[float] = [],
-        temperal_downsample: List[bool] = [False, True, True],
+        attn_scales: list[float] = [],
+        temperal_downsample: list[bool] = [False, True, True],
         dropout: float = 0.0,
-        latents_mean: List[float] = [
+        latents_mean: list[float] = [
             -0.7571,
             -0.7089,
             -0.9113,
@@ -1027,7 +1036,7 @@ class AutoencoderKLWan(ModelMixin, ConfigMixin, FromOriginalModelMixin):
             0.2503,
             -0.2921,
         ],
-        latents_std: List[float] = [
+        latents_std: list[float] = [
             2.8184,
             1.4541,
             2.3275,
@@ -1048,9 +1057,9 @@ class AutoencoderKLWan(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         is_residual: bool = False,
         in_channels: int = 3,
         out_channels: int = 3,
-        patch_size: Optional[int] = None,
-        scale_factor_temporal: Optional[int] = 4,
-        scale_factor_spatial: Optional[int] = 8,
+        patch_size: int | None = None,
+        scale_factor_temporal: int | None = 4,
+        scale_factor_spatial: int | None = 8,
     ) -> None:
         super().__init__()
 
@@ -1118,10 +1127,10 @@ class AutoencoderKLWan(ModelMixin, ConfigMixin, FromOriginalModelMixin):
 
     def enable_tiling(
         self,
-        tile_sample_min_height: Optional[int] = None,
-        tile_sample_min_width: Optional[int] = None,
-        tile_sample_stride_height: Optional[float] = None,
-        tile_sample_stride_width: Optional[float] = None,
+        tile_sample_min_height: int | None = None,
+        tile_sample_min_width: int | None = None,
+        tile_sample_stride_height: float | None = None,
+        tile_sample_stride_width: float | None = None,
     ) -> None:
         r"""
         Enable tiled VAE decoding. When this option is enabled, the VAE will split the input tensor into tiles to
@@ -1145,27 +1154,6 @@ class AutoencoderKLWan(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         self.tile_sample_min_width = tile_sample_min_width or self.tile_sample_min_width
         self.tile_sample_stride_height = tile_sample_stride_height or self.tile_sample_stride_height
         self.tile_sample_stride_width = tile_sample_stride_width or self.tile_sample_stride_width
-
-    def disable_tiling(self) -> None:
-        r"""
-        Disable tiled VAE decoding. If `enable_tiling` was previously enabled, this method will go back to computing
-        decoding in one step.
-        """
-        self.use_tiling = False
-
-    def enable_slicing(self) -> None:
-        r"""
-        Enable sliced VAE decoding. When this option is enabled, the VAE will split the input tensor in slices to
-        compute decoding in several steps. This is useful to save some memory and allow larger batch sizes.
-        """
-        self.use_slicing = True
-
-    def disable_slicing(self) -> None:
-        r"""
-        Disable sliced VAE decoding. If `enable_slicing` was previously enabled, this method will go back to computing
-        decoding in one step.
-        """
-        self.use_slicing = False
 
     def clear_cache(self):
         # Use cached conv counts for decoder and encoder to avoid re-iterating modules each call
@@ -1209,7 +1197,7 @@ class AutoencoderKLWan(ModelMixin, ConfigMixin, FromOriginalModelMixin):
     @apply_forward_hook
     def encode(
         self, x: torch.Tensor, return_dict: bool = True
-    ) -> Union[AutoencoderKLOutput, Tuple[DiagonalGaussianDistribution]]:
+    ) -> AutoencoderKLOutput | tuple[DiagonalGaussianDistribution]:
         r"""
         Encode a batch of images into latents.
 
@@ -1272,7 +1260,7 @@ class AutoencoderKLWan(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         return DecoderOutput(sample=out)
 
     @apply_forward_hook
-    def decode(self, z: torch.Tensor, return_dict: bool = True) -> Union[DecoderOutput, torch.Tensor]:
+    def decode(self, z: torch.Tensor, return_dict: bool = True) -> DecoderOutput | torch.Tensor:
         r"""
         Decode a batch of images.
 
@@ -1323,14 +1311,20 @@ class AutoencoderKLWan(ModelMixin, ConfigMixin, FromOriginalModelMixin):
             `torch.Tensor`:
                 The latent representation of the encoded videos.
         """
-        _, _, num_frames, height, width = x.shape
-        latent_height = height // self.spatial_compression_ratio
-        latent_width = width // self.spatial_compression_ratio
 
-        tile_latent_min_height = self.tile_sample_min_height // self.spatial_compression_ratio
-        tile_latent_min_width = self.tile_sample_min_width // self.spatial_compression_ratio
-        tile_latent_stride_height = self.tile_sample_stride_height // self.spatial_compression_ratio
-        tile_latent_stride_width = self.tile_sample_stride_width // self.spatial_compression_ratio
+        _, _, num_frames, height, width = x.shape
+        encode_spatial_compression_ratio = self.spatial_compression_ratio
+        if self.config.patch_size is not None:
+            assert encode_spatial_compression_ratio % self.config.patch_size == 0
+            encode_spatial_compression_ratio = self.spatial_compression_ratio // self.config.patch_size
+
+        latent_height = height // encode_spatial_compression_ratio
+        latent_width = width // encode_spatial_compression_ratio
+
+        tile_latent_min_height = self.tile_sample_min_height // encode_spatial_compression_ratio
+        tile_latent_min_width = self.tile_sample_min_width // encode_spatial_compression_ratio
+        tile_latent_stride_height = self.tile_sample_stride_height // encode_spatial_compression_ratio
+        tile_latent_stride_width = self.tile_sample_stride_width // encode_spatial_compression_ratio
 
         blend_height = tile_latent_min_height - tile_latent_stride_height
         blend_width = tile_latent_min_width - tile_latent_stride_width
@@ -1379,7 +1373,7 @@ class AutoencoderKLWan(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         enc = torch.cat(result_rows, dim=3)[:, :, :, :latent_height, :latent_width]
         return enc
 
-    def tiled_decode(self, z: torch.Tensor, return_dict: bool = True) -> Union[DecoderOutput, torch.Tensor]:
+    def tiled_decode(self, z: torch.Tensor, return_dict: bool = True) -> DecoderOutput | torch.Tensor:
         r"""
         Decode a batch of images using a tiled decoder.
 
@@ -1401,9 +1395,18 @@ class AutoencoderKLWan(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         tile_latent_min_width = self.tile_sample_min_width // self.spatial_compression_ratio
         tile_latent_stride_height = self.tile_sample_stride_height // self.spatial_compression_ratio
         tile_latent_stride_width = self.tile_sample_stride_width // self.spatial_compression_ratio
-
-        blend_height = self.tile_sample_min_height - self.tile_sample_stride_height
-        blend_width = self.tile_sample_min_width - self.tile_sample_stride_width
+        tile_sample_stride_height = self.tile_sample_stride_height
+        tile_sample_stride_width = self.tile_sample_stride_width
+        if self.config.patch_size is not None:
+            sample_height = sample_height // self.config.patch_size
+            sample_width = sample_width // self.config.patch_size
+            tile_sample_stride_height = tile_sample_stride_height // self.config.patch_size
+            tile_sample_stride_width = tile_sample_stride_width // self.config.patch_size
+            blend_height = self.tile_sample_min_height // self.config.patch_size - tile_sample_stride_height
+            blend_width = self.tile_sample_min_width // self.config.patch_size - tile_sample_stride_width
+        else:
+            blend_height = self.tile_sample_min_height - tile_sample_stride_height
+            blend_width = self.tile_sample_min_width - tile_sample_stride_width
 
         # Split z into overlapping tiles and decode them separately.
         # The tiles have an overlap to avoid seams between tiles.
@@ -1417,7 +1420,9 @@ class AutoencoderKLWan(ModelMixin, ConfigMixin, FromOriginalModelMixin):
                     self._conv_idx = [0]
                     tile = z[:, :, k : k + 1, i : i + tile_latent_min_height, j : j + tile_latent_min_width]
                     tile = self.post_quant_conv(tile)
-                    decoded = self.decoder(tile, feat_cache=self._feat_map, feat_idx=self._conv_idx)
+                    decoded = self.decoder(
+                        tile, feat_cache=self._feat_map, feat_idx=self._conv_idx, first_chunk=(k == 0)
+                    )
                     time.append(decoded)
                 row.append(torch.cat(time, dim=2))
             rows.append(row)
@@ -1433,10 +1438,14 @@ class AutoencoderKLWan(ModelMixin, ConfigMixin, FromOriginalModelMixin):
                     tile = self.blend_v(rows[i - 1][j], tile, blend_height)
                 if j > 0:
                     tile = self.blend_h(row[j - 1], tile, blend_width)
-                result_row.append(tile[:, :, :, : self.tile_sample_stride_height, : self.tile_sample_stride_width])
+                result_row.append(tile[:, :, :, :tile_sample_stride_height, :tile_sample_stride_width])
             result_rows.append(torch.cat(result_row, dim=-1))
-
         dec = torch.cat(result_rows, dim=3)[:, :, :, :sample_height, :sample_width]
+
+        if self.config.patch_size is not None:
+            dec = unpatchify(dec, patch_size=self.config.patch_size)
+
+        dec = torch.clamp(dec, min=-1.0, max=1.0)
 
         if not return_dict:
             return (dec,)
@@ -1447,8 +1456,8 @@ class AutoencoderKLWan(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         sample: torch.Tensor,
         sample_posterior: bool = False,
         return_dict: bool = True,
-        generator: Optional[torch.Generator] = None,
-    ) -> Union[DecoderOutput, torch.Tensor]:
+        generator: torch.Generator | None = None,
+    ) -> DecoderOutput | torch.Tensor:
         """
         Args:
             sample (`torch.Tensor`): Input sample.
@@ -1457,6 +1466,7 @@ class AutoencoderKLWan(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         """
         x = sample
         posterior = self.encode(x).latent_dist
+
         if sample_posterior:
             z = posterior.sample(generator=generator)
         else:

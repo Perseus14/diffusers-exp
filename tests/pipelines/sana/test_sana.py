@@ -23,6 +23,7 @@ from transformers import Gemma2Config, Gemma2Model, GemmaTokenizer
 from diffusers import AutoencoderDC, FlowMatchEulerDiscreteScheduler, SanaPipeline, SanaTransformer2DModel
 
 from ...testing_utils import (
+    IS_GITHUB_ACTIONS,
     backend_empty_cache,
     enable_full_determinism,
     require_torch_accelerator,
@@ -289,13 +290,13 @@ class SanaPipelineFastTests(PipelineTesterMixin, unittest.TestCase):
 
     # TODO(aryan): Create a dummy gemma model with smol vocab size
     @unittest.skip(
-        "A very small vocab size is used for fast tests. So, any kind of prompt other than the empty default used in other tests will lead to a embedding lookup error. This test uses a long prompt that causes the error."
+        "A very small vocab size is used for fast tests. So, Any kind of prompt other than the empty default used in other tests will lead to a embedding lookup error. This test uses a long prompt that causes the error."
     )
     def test_inference_batch_consistent(self):
         pass
 
     @unittest.skip(
-        "A very small vocab size is used for fast tests. So, any kind of prompt other than the empty default used in other tests will lead to a embedding lookup error. This test uses a long prompt that causes the error."
+        "A very small vocab size is used for fast tests. So, Any kind of prompt other than the empty default used in other tests will lead to a embedding lookup error. This test uses a long prompt that causes the error."
     )
     def test_inference_batch_single_identical(self):
         pass
@@ -303,6 +304,10 @@ class SanaPipelineFastTests(PipelineTesterMixin, unittest.TestCase):
     def test_float16_inference(self):
         # Requires higher tolerance as model seems very sensitive to dtype
         super().test_float16_inference(expected_max_diff=0.08)
+
+    @unittest.skipIf(IS_GITHUB_ACTIONS, reason="Skipping test inside GitHub Actions environment")
+    def test_layerwise_casting_inference(self):
+        super().test_layerwise_casting_inference()
 
 
 @slow

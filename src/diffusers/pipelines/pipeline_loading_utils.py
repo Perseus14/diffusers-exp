@@ -17,7 +17,7 @@ import os
 import re
 import warnings
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Union
+from typing import Any, Callable
 
 import httpx
 import requests
@@ -33,6 +33,7 @@ from ..utils import (
     ONNX_WEIGHTS_NAME,
     SAFETENSORS_WEIGHTS_NAME,
     WEIGHTS_NAME,
+    _maybe_remap_transformers_class,
     deprecate,
     get_class_from_dynamic_module,
     is_accelerate_available,
@@ -75,6 +76,7 @@ LOADABLE_CLASSES = {
         "SchedulerMixin": ["save_pretrained", "from_pretrained"],
         "DiffusionPipeline": ["save_pretrained", "from_pretrained"],
         "OnnxRuntimeModel": ["save_pretrained", "from_pretrained"],
+        "BaseGuidance": ["save_pretrained", "from_pretrained"],
     },
     "transformers": {
         "PreTrainedTokenizer": ["save_pretrained", "from_pretrained"],
@@ -208,7 +210,7 @@ def filter_with_regex(filenames, pattern_re):
     return {f for f in filenames if pattern_re.match(f.split("/")[-1]) is not None}
 
 
-def variant_compatible_siblings(filenames, variant=None, ignore_patterns=None) -> Union[List[os.PathLike], str]:
+def variant_compatible_siblings(filenames, variant=None, ignore_patterns=None) -> list[os.PathLike] | str:
     weight_names = [
         WEIGHTS_NAME,
         SAFETENSORS_WEIGHTS_NAME,
@@ -356,6 +358,11 @@ def maybe_raise_or_warn(
     """Simple helper method to raise or warn in case incorrect module has been passed"""
     if not is_pipeline_module:
         library = importlib.import_module(library_name)
+
+        # Handle deprecated Transformers classes
+        if library_name == "transformers":
+            class_name = _maybe_remap_transformers_class(class_name) or class_name
+
         class_obj = getattr(library, class_name)
         class_candidates = {c: getattr(library, c, None) for c in importable_classes.keys()}
 
@@ -390,6 +397,11 @@ def simple_get_class_obj(library_name, class_name):
         class_obj = getattr(pipeline_module, class_name)
     else:
         library = importlib.import_module(library_name)
+
+        # Handle deprecated Transformers classes
+        if library_name == "transformers":
+            class_name = _maybe_remap_transformers_class(class_name) or class_name
+
         class_obj = getattr(library, class_name)
 
     return class_obj
@@ -415,6 +427,10 @@ def get_class_obj_and_candidates(
     else:
         # else we just import it from the library.
         library = importlib.import_module(library_name)
+
+        # Handle deprecated Transformers classes
+        if library_name == "transformers":
+            class_name = _maybe_remap_transformers_class(class_name) or class_name
 
         class_obj = getattr(library, class_name)
         class_candidates = {c: getattr(library, c, None) for c in importable_classes.keys()}
@@ -509,12 +525,12 @@ def _get_pipeline_class(
 def _load_empty_model(
     library_name: str,
     class_name: str,
-    importable_classes: List[Any],
+    importable_classes: list[Any],
     pipelines: Any,
     is_pipeline_module: bool,
     name: str,
-    torch_dtype: Union[str, torch.dtype],
-    cached_folder: Union[str, os.PathLike],
+    torch_dtype: str | torch.dtype,
+    cached_folder: str | os.PathLike,
     **kwargs,
 ):
     # retrieve class objects.
@@ -591,7 +607,7 @@ def _load_empty_model(
 
 
 def _assign_components_to_devices(
-    module_sizes: Dict[str, float], device_memory: Dict[str, float], device_mapping_strategy: str = "balanced"
+    module_sizes: dict[str, float], device_memory: dict[str, float], device_mapping_strategy: str = "balanced"
 ):
     device_ids = list(device_memory.keys())
     device_cycle = device_ids + device_ids[::-1]
@@ -722,27 +738,28 @@ def _get_final_device_map(device_map, pipeline_class, passed_class_obj, init_dic
 def load_sub_model(
     library_name: str,
     class_name: str,
-    importable_classes: List[Any],
+    importable_classes: list[Any],
     pipelines: Any,
     is_pipeline_module: bool,
     pipeline_class: Any,
     torch_dtype: torch.dtype,
     provider: Any,
     sess_options: Any,
-    device_map: Optional[Union[Dict[str, torch.device], str]],
-    max_memory: Optional[Dict[Union[int, str], Union[int, str]]],
-    offload_folder: Optional[Union[str, os.PathLike]],
+    device_map: dict[str, torch.device] | str | None,
+    max_memory: dict[int | str, int | str] | None,
+    offload_folder: str | os.PathLike | None,
     offload_state_dict: bool,
-    model_variants: Dict[str, str],
+    model_variants: dict[str, str],
     name: str,
     from_flax: bool,
     variant: str,
     low_cpu_mem_usage: bool,
-    cached_folder: Union[str, os.PathLike],
+    cached_folder: str | os.PathLike,
     use_safetensors: bool,
-    dduf_entries: Optional[Dict[str, DDUFEntry]],
+    dduf_entries: dict[str, DDUFEntry] | None,
     provider_options: Any,
-    quantization_config: Optional[Any] = None,
+    disable_mmap: bool,
+    quantization_config: Any | None = None,
 ):
     """Helper method to load the module `name` from `library_name` and `class_name`"""
     from ..quantizers import PipelineQuantizationConfig
@@ -785,12 +802,6 @@ def load_sub_model(
     # add kwargs to loading method
     diffusers_module = importlib.import_module(__name__.split(".")[0])
     loading_kwargs = {}
-    if issubclass(class_obj, torch.nn.Module):
-        loading_kwargs["torch_dtype"] = torch_dtype
-    if issubclass(class_obj, diffusers_module.OnnxRuntimeModel):
-        loading_kwargs["provider"] = provider
-        loading_kwargs["sess_options"] = sess_options
-        loading_kwargs["provider_options"] = provider_options
 
     is_diffusers_model = issubclass(class_obj, diffusers_module.ModelMixin)
 
@@ -804,6 +815,17 @@ def load_sub_model(
         and issubclass(class_obj, PreTrainedModel)
         and transformers_version >= version.parse("4.20.0")
     )
+
+    # For transformers models >= 4.56.0, use 'dtype' instead of 'torch_dtype' to avoid deprecation warnings
+    if issubclass(class_obj, torch.nn.Module):
+        if is_transformers_model and transformers_version >= version.parse("4.56.0"):
+            loading_kwargs["dtype"] = torch_dtype
+        else:
+            loading_kwargs["torch_dtype"] = torch_dtype
+    if issubclass(class_obj, diffusers_module.OnnxRuntimeModel):
+        loading_kwargs["provider"] = provider
+        loading_kwargs["sess_options"] = sess_options
+        loading_kwargs["provider_options"] = provider_options
 
     # When loading a transformers model, if the device_map is None, the weights will be initialized as opposed to diffusers.
     # To make default loading faster we set the `low_cpu_mem_usage=low_cpu_mem_usage` flag which is `True` by default.
@@ -838,6 +860,9 @@ def load_sub_model(
         else:
             loading_kwargs["low_cpu_mem_usage"] = False
 
+    if is_diffusers_model:
+        loading_kwargs["disable_mmap"] = disable_mmap
+
     if is_transformers_model and is_transformers_version(">=", "4.57.0"):
         loading_kwargs.pop("offload_state_dict")
 
@@ -866,6 +891,9 @@ def load_sub_model(
         # remove hooks
         remove_hook_from_module(loaded_sub_model, recurse=True)
         needs_offloading_to_cpu = device_map[""] == "cpu"
+        skip_keys = None
+        if hasattr(loaded_sub_model, "_skip_keys") and loaded_sub_model._skip_keys is not None:
+            skip_keys = loaded_sub_model._skip_keys
 
         if needs_offloading_to_cpu:
             dispatch_model(
@@ -874,9 +902,10 @@ def load_sub_model(
                 device_map=device_map,
                 force_hooks=True,
                 main_device=0,
+                skip_keys=skip_keys,
             )
         else:
-            dispatch_model(loaded_sub_model, device_map=device_map, force_hooks=True)
+            dispatch_model(loaded_sub_model, device_map=device_map, force_hooks=True, skip_keys=skip_keys)
 
     return loaded_sub_model
 
@@ -1021,10 +1050,10 @@ def _update_init_kwargs_with_connected_pipeline(
 
 def _get_custom_components_and_folders(
     pretrained_model_name: str,
-    config_dict: Dict[str, Any],
-    filenames: Optional[List[str]] = None,
-    variant_filenames: Optional[List[str]] = None,
-    variant: Optional[str] = None,
+    config_dict: dict[str, Any],
+    filenames: list[str] | None = None,
+    variant_filenames: list[str] | None = None,
+    variant: str | None = None,
 ):
     config_dict = config_dict.copy()
 
@@ -1057,15 +1086,15 @@ def _get_custom_components_and_folders(
 
 def _get_ignore_patterns(
     passed_components,
-    model_folder_names: List[str],
-    model_filenames: List[str],
+    model_folder_names: list[str],
+    model_filenames: list[str],
     use_safetensors: bool,
     from_flax: bool,
     allow_pickle: bool,
     use_onnx: bool,
     is_onnx: bool,
-    variant: Optional[str] = None,
-) -> List[str]:
+    variant: str | None = None,
+) -> list[str]:
     if (
         use_safetensors
         and not allow_pickle

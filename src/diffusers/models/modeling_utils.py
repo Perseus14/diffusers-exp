@@ -27,7 +27,7 @@ from collections import OrderedDict
 from contextlib import ExitStack, contextmanager
 from functools import wraps
 from pathlib import Path
-from typing import Any, Callable, ContextManager, Dict, List, Optional, Tuple, Type, Union
+from typing import Any, Callable, ContextManager, Type
 
 import safetensors
 import torch
@@ -59,11 +59,8 @@ from ..utils import (
     is_torch_version,
     logging,
 )
-from ..utils.hub_utils import (
-    PushToHubMixin,
-    load_or_create_model_card,
-    populate_model_card,
-)
+from ..utils.distributed_utils import is_torch_dist_rank_zero
+from ..utils.hub_utils import PushToHubMixin, load_or_create_model_card, populate_model_card
 from ..utils.torch_utils import empty_device_cache
 from ._modeling_parallel import ContextParallelConfig, ContextParallelModelPlan, ParallelConfig
 from .model_loading_utils import (
@@ -84,7 +81,7 @@ class ContextManagers:
     in the `fastcore` library.
     """
 
-    def __init__(self, context_managers: List[ContextManager]):
+    def __init__(self, context_managers: list[ContextManager]):
         self.context_managers = context_managers
         self.stack = ExitStack()
 
@@ -146,7 +143,7 @@ def get_parameter_device(parameter: torch.nn.Module) -> torch.device:
     except StopIteration:
         # For torch.nn.DataParallel compatibility in PyTorch 1.5
 
-        def find_tensor_attributes(module: torch.nn.Module) -> List[Tuple[str, Tensor]]:
+        def find_tensor_attributes(module: torch.nn.Module) -> list[tuple[str, Tensor]]:
             tuples = [(k, v) for k, v in module.__dict__.items() if torch.is_tensor(v)]
             return tuples
 
@@ -194,7 +191,7 @@ def get_parameter_dtype(parameter: torch.nn.Module) -> torch.dtype:
         return last_dtype
 
     # For nn.DataParallel compatibility in PyTorch > 1.5
-    def find_tensor_attributes(module: nn.Module) -> List[Tuple[str, Tensor]]:
+    def find_tensor_attributes(module: nn.Module) -> list[tuple[str, Tensor]]:
         tuples = [(k, v) for k, v in module.__dict__.items() if torch.is_tensor(v)]
         return tuples
 
@@ -251,6 +248,7 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
     _repeated_blocks = []
     _parallel_config = None
     _cp_plan = None
+    _skip_keys = None
 
     def __init__(self):
         super().__init__()
@@ -282,7 +280,7 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
         """
         return any(hasattr(m, "gradient_checkpointing") and m.gradient_checkpointing for m in self.modules())
 
-    def enable_gradient_checkpointing(self, gradient_checkpointing_func: Optional[Callable] = None) -> None:
+    def enable_gradient_checkpointing(self, gradient_checkpointing_func: Callable | None = None) -> None:
         """
         Activates gradient checkpointing for the current model (may be referred to as *activation checkpointing* or
         *checkpoint activations* in other frameworks).
@@ -351,7 +349,7 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
         self.set_use_npu_flash_attention(False)
 
     def set_use_xla_flash_attention(
-        self, use_xla_flash_attention: bool, partition_spec: Optional[Callable] = None, **kwargs
+        self, use_xla_flash_attention: bool, partition_spec: Callable | None = None, **kwargs
     ) -> None:
         # Recursively walk through all the children.
         # Any children which exposes the set_use_xla_flash_attention method
@@ -367,7 +365,7 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
             if isinstance(module, torch.nn.Module):
                 fn_recursive_set_flash_attention(module)
 
-    def enable_xla_flash_attention(self, partition_spec: Optional[Callable] = None, **kwargs):
+    def enable_xla_flash_attention(self, partition_spec: Callable | None = None, **kwargs):
         r"""
         Enable the flash attention pallals kernel for torch_xla.
         """
@@ -379,9 +377,7 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
         """
         self.set_use_xla_flash_attention(False)
 
-    def set_use_memory_efficient_attention_xformers(
-        self, valid: bool, attention_op: Optional[Callable] = None
-    ) -> None:
+    def set_use_memory_efficient_attention_xformers(self, valid: bool, attention_op: Callable | None = None) -> None:
         # Recursively walk through all the children.
         # Any children which exposes the set_use_memory_efficient_attention_xformers method
         # gets the message
@@ -396,7 +392,7 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
             if isinstance(module, torch.nn.Module):
                 fn_recursive_set_mem_eff(module)
 
-    def enable_xformers_memory_efficient_attention(self, attention_op: Optional[Callable] = None) -> None:
+    def enable_xformers_memory_efficient_attention(self, attention_op: Callable | None = None) -> None:
         r"""
         Enable memory efficient attention from [xFormers](https://facebookresearch.github.io/xformers/).
 
@@ -437,9 +433,9 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
     def enable_layerwise_casting(
         self,
         storage_dtype: torch.dtype = torch.float8_e4m3fn,
-        compute_dtype: Optional[torch.dtype] = None,
-        skip_modules_pattern: Optional[Tuple[str, ...]] = None,
-        skip_modules_classes: Optional[Tuple[Type[torch.nn.Module], ...]] = None,
+        compute_dtype: torch.dtype | None = None,
+        skip_modules_pattern: tuple[str, ...] | None = None,
+        skip_modules_classes: tuple[Type[torch.nn.Module], ...] | None = None,
         non_blocking: bool = False,
     ) -> None:
         r"""
@@ -475,11 +471,11 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
                 The dtype to which the model should be cast for storage.
             compute_dtype (`torch.dtype`):
                 The dtype to which the model weights should be cast during the forward pass.
-            skip_modules_pattern (`Tuple[str, ...]`, *optional*):
+            skip_modules_pattern (`tuple[str, ...]`, *optional*):
                 A list of patterns to match the names of the modules to skip during the layerwise casting process. If
                 set to `None`, default skip patterns are used to ignore certain internal layers of modules and PEFT
                 layers.
-            skip_modules_classes (`Tuple[Type[torch.nn.Module], ...]`, *optional*):
+            skip_modules_classes (`tuple[Type[torch.nn.Module], ...]`, *optional*):
                 A list of module classes to skip during the layerwise casting process.
             non_blocking (`bool`, *optional*, defaults to `False`):
                 If `True`, the weight casting operations are non-blocking.
@@ -524,12 +520,14 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
         onload_device: torch.device,
         offload_device: torch.device = torch.device("cpu"),
         offload_type: str = "block_level",
-        num_blocks_per_group: Optional[int] = None,
+        num_blocks_per_group: int | None = None,
         non_blocking: bool = False,
         use_stream: bool = False,
         record_stream: bool = False,
         low_cpu_mem_usage=False,
-        offload_to_disk_path: Optional[str] = None,
+        offload_to_disk_path: str | None = None,
+        block_modules: str | None = None,
+        exclude_kwargs: str | None = None,
     ) -> None:
         r"""
         Activates group offloading for the current model.
@@ -569,6 +567,7 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
                 f"`_supports_group_offloading` to `True` in the class definition. If you believe this is a mistake, please "
                 f"open an issue at https://github.com/huggingface/diffusers/issues."
             )
+
         apply_group_offloading(
             module=self,
             onload_device=onload_device,
@@ -580,6 +579,8 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
             record_stream=record_stream,
             low_cpu_mem_usage=low_cpu_mem_usage,
             offload_to_disk_path=offload_to_disk_path,
+            block_modules=block_modules,
+            exclude_kwargs=exclude_kwargs,
         )
 
     def set_attention_backend(self, backend: str) -> None:
@@ -594,21 +595,45 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
                 attention as backend.
         """
         from .attention import AttentionModuleMixin
-        from .attention_dispatch import AttentionBackendName, _check_attention_backend_requirements
+        from .attention_dispatch import (
+            AttentionBackendName,
+            _AttentionBackendRegistry,
+            _check_attention_backend_requirements,
+            _maybe_download_kernel_for_backend,
+        )
 
         # TODO: the following will not be required when everything is refactored to AttentionModuleMixin
         from .attention_processor import Attention, MochiAttention
 
         logger.warning("Attention backends are an experimental feature and the API may be subject to change.")
+        attention_classes = (Attention, MochiAttention, AttentionModuleMixin)
+
+        parallel_config_set = False
+        for module in self.modules():
+            if not isinstance(module, attention_classes):
+                continue
+            processor = module.processor
+            if getattr(processor, "_parallel_config", None) is not None:
+                parallel_config_set = True
+                break
 
         backend = backend.lower()
         available_backends = {x.value for x in AttentionBackendName.__members__.values()}
         if backend not in available_backends:
             raise ValueError(f"`{backend=}` must be one of the following: " + ", ".join(available_backends))
-        backend = AttentionBackendName(backend)
-        _check_attention_backend_requirements(backend)
 
-        attention_classes = (Attention, MochiAttention, AttentionModuleMixin)
+        backend = AttentionBackendName(backend)
+        if parallel_config_set and not _AttentionBackendRegistry._is_context_parallel_available(backend):
+            compatible_backends = sorted(_AttentionBackendRegistry._supports_context_parallel)
+            raise ValueError(
+                f"Context parallelism is enabled but current attention backend '{backend.value}' "
+                f"does not support context parallelism. "
+                f"Please set a compatible attention backend: {compatible_backends} using `model.set_attention_backend()`."
+            )
+
+        _check_attention_backend_requirements(backend)
+        _maybe_download_kernel_for_backend(backend)
+
         for module in self.modules():
             if not isinstance(module, attention_classes):
                 continue
@@ -616,6 +641,9 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
             if processor is None or not hasattr(processor, "_attention_backend"):
                 continue
             processor._attention_backend = backend
+
+        # Important to set the active backend so that it propagates gracefully throughout.
+        _AttentionBackendRegistry.set_active_backend(backend)
 
     def reset_attention_backend(self) -> None:
         """
@@ -638,12 +666,12 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
 
     def save_pretrained(
         self,
-        save_directory: Union[str, os.PathLike],
+        save_directory: str | os.PathLike,
         is_main_process: bool = True,
-        save_function: Optional[Callable] = None,
+        save_function: Callable | None = None,
         safe_serialization: bool = True,
-        variant: Optional[str] = None,
-        max_shard_size: Union[int, str] = "10GB",
+        variant: str | None = None,
+        max_shard_size: int | str = "10GB",
         push_to_hub: bool = False,
         **kwargs,
     ):
@@ -677,7 +705,7 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
                 Whether or not to push your model to the Hugging Face Hub after saving it. You can specify the
                 repository you want to push to with `repo_id` (will default to the name of `save_directory` in your
                 namespace).
-            kwargs (`Dict[str, Any]`, *optional*):
+            kwargs (`dict[str, Any]`, *optional*):
                 Additional keyword arguments passed along to the [`~utils.PushToHubMixin.push_to_hub`] method.
         """
         if os.path.isfile(save_directory):
@@ -805,7 +833,7 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
 
     @classmethod
     @validate_hf_hub_args
-    def from_pretrained(cls, pretrained_model_name_or_path: Optional[Union[str, os.PathLike]], **kwargs) -> Self:
+    def from_pretrained(cls, pretrained_model_name_or_path: str | os.PathLike | None, **kwargs) -> Self:
         r"""
         Instantiate a pretrained PyTorch model from a pretrained model configuration.
 
@@ -821,7 +849,7 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
                     - A path to a *directory* (for example `./my_model_directory`) containing the model weights saved
                       with [`~ModelMixin.save_pretrained`].
 
-            cache_dir (`Union[str, os.PathLike]`, *optional*):
+            cache_dir (`str | os.PathLike`, *optional*):
                 Path to a directory where a downloaded pretrained model configuration is cached if the standard cache
                 is not used.
             torch_dtype (`torch.dtype`, *optional*):
@@ -829,7 +857,7 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
             force_download (`bool`, *optional*, defaults to `False`):
                 Whether or not to force the (re-)download of the model weights and configuration files, overriding the
                 cached versions if they exist.
-            proxies (`Dict[str, str]`, *optional*):
+            proxies (`dict[str, str]`, *optional*):
                 A dictionary of proxy servers to use by protocol or endpoint, for example, `{'http': 'foo.bar:3128',
                 'http://hostname': 'foo.bar:4012'}`. The proxies are used on each request.
             output_loading_info (`bool`, *optional*, defaults to `False`):
@@ -851,7 +879,7 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
                 Mirror source to resolve accessibility issues if you're downloading a model in China. We do not
                 guarantee the timeliness or safety of the source, and you should refer to the mirror site for more
                 information.
-            device_map (`Union[int, str, torch.device]` or `Dict[str, Union[int, str, torch.device]]`, *optional*):
+            device_map (`int | str | torch.device` or `dict[str, int | str | torch.device]`, *optional*):
                 A map that specifies where each submodule should go. It doesn't need to be defined for each
                 parameter/buffer name; once a given module name is inside, every submodule of it will be sent to the
                 same device. Defaults to `None`, meaning that the model will be loaded on CPU.
@@ -923,13 +951,13 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
         ```py
         from diffusers import UNet2DConditionModel
 
-        unet = UNet2DConditionModel.from_pretrained("runwayml/stable-diffusion-v1-5", subfolder="unet")
+        unet = UNet2DConditionModel.from_pretrained("stable-diffusion-v1-5/stable-diffusion-v1-5", subfolder="unet")
         ```
 
         If you get the error message below, you need to finetune the weights for your downstream task:
 
         ```bash
-        Some weights of UNet2DConditionModel were not initialized from the model checkpoint at runwayml/stable-diffusion-v1-5 and are newly initialized because the shapes did not match:
+        Some weights of UNet2DConditionModel were not initialized from the model checkpoint at stable-diffusion-v1-5/stable-diffusion-v1-5 and are newly initialized because the shapes did not match:
         - conv_in.weight: found shape torch.Size([320, 4, 3, 3]) in the checkpoint and torch.Size([320, 9, 3, 3]) in the model instantiated
         You should probably TRAIN this model on a down-stream task to be able to use it for predictions and inference.
         ```
@@ -953,9 +981,9 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
         variant = kwargs.pop("variant", None)
         use_safetensors = kwargs.pop("use_safetensors", None)
         quantization_config = kwargs.pop("quantization_config", None)
-        dduf_entries: Optional[Dict[str, DDUFEntry]] = kwargs.pop("dduf_entries", None)
+        dduf_entries: dict[str, DDUFEntry] | None = kwargs.pop("dduf_entries", None)
         disable_mmap = kwargs.pop("disable_mmap", False)
-        parallel_config: Optional[Union[ParallelConfig, ContextParallelConfig]] = kwargs.pop("parallel_config", None)
+        parallel_config: ParallelConfig | ContextParallelConfig | None = kwargs.pop("parallel_config", None)
 
         is_parallel_loading_enabled = HF_ENABLE_PARALLEL_LOADING
         if is_parallel_loading_enabled and not low_cpu_mem_usage:
@@ -1297,6 +1325,7 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
             keep_in_fp32_modules=keep_in_fp32_modules,
             dduf_entries=dduf_entries,
             is_parallel_loading_enabled=is_parallel_loading_enabled,
+            disable_mmap=disable_mmap,
         )
         loading_info = {
             "missing_keys": missing_keys,
@@ -1351,12 +1380,12 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
 
         # Checks if the model has been loaded in 4-bit or 8-bit with BNB
         if getattr(self, "quantization_method", None) == QuantizationMethod.BITS_AND_BYTES:
-            if getattr(self, "is_loaded_in_8bit", False):
+            if getattr(self, "is_loaded_in_8bit", False) and is_bitsandbytes_version("<", "0.48.0"):
                 raise ValueError(
-                    "Calling `cuda()` is not supported for `8-bit` quantized models. "
-                    " Please use the model as it is, since the model has already been set to the correct devices."
+                    "Calling `cuda()` is not supported for `8-bit` quantized models with the installed version of bitsandbytes. "
+                    f"The current device is `{self.device}`. If you intended to move the model, please install bitsandbytes >= 0.48.0."
                 )
-            elif is_bitsandbytes_version("<", "0.43.2"):
+            elif getattr(self, "is_loaded_in_4bit", False) and is_bitsandbytes_version("<", "0.43.2"):
                 raise ValueError(
                     "Calling `cuda()` is not supported for `4-bit` quantized models with the installed version of bitsandbytes. "
                     f"The current device is `{self.device}`. If you intended to move the model, please install bitsandbytes >= 0.43.2."
@@ -1403,17 +1432,16 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
                 )
 
         if getattr(self, "quantization_method", None) == QuantizationMethod.BITS_AND_BYTES:
-            if getattr(self, "is_loaded_in_8bit", False):
+            if getattr(self, "is_loaded_in_8bit", False) and is_bitsandbytes_version("<", "0.48.0"):
                 raise ValueError(
-                    "`.to` is not supported for `8-bit` bitsandbytes models. Please use the model as it is, since the"
-                    " model has already been set to the correct devices and casted to the correct `dtype`."
+                    "Calling `to()` is not supported for `8-bit` quantized models with the installed version of bitsandbytes. "
+                    f"The current device is `{self.device}`. If you intended to move the model, please install bitsandbytes >= 0.48.0."
                 )
-            elif is_bitsandbytes_version("<", "0.43.2"):
+            elif getattr(self, "is_loaded_in_4bit", False) and is_bitsandbytes_version("<", "0.43.2"):
                 raise ValueError(
                     "Calling `to()` is not supported for `4-bit` quantized models with the installed version of bitsandbytes. "
                     f"The current device is `{self.device}`. If you intended to move the model, please install bitsandbytes >= 0.43.2."
                 )
-
         if _is_group_offload_enabled(self) and device_arg_or_kwarg_present:
             logger.warning(
                 f"The module '{self.__class__.__name__}' is group offloaded and moving it using `.to()` is not supported."
@@ -1480,22 +1508,25 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
     def enable_parallelism(
         self,
         *,
-        config: Union[ParallelConfig, ContextParallelConfig],
-        cp_plan: Optional[Dict[str, ContextParallelModelPlan]] = None,
+        config: ParallelConfig | ContextParallelConfig,
+        cp_plan: dict[str, ContextParallelModelPlan] | None = None,
     ):
-        from ..hooks.context_parallel import apply_context_parallel
-        from .attention import AttentionModuleMixin
-        from .attention_processor import Attention, MochiAttention
-
         logger.warning(
             "`enable_parallelism` is an experimental feature. The API may change in the future and breaking changes may be introduced at any time without warning."
         )
 
+        if not torch.distributed.is_available() and not torch.distributed.is_initialized():
+            raise RuntimeError(
+                "torch.distributed must be available and initialized before calling `enable_parallelism`."
+            )
+
+        from ..hooks.context_parallel import apply_context_parallel
+        from .attention import AttentionModuleMixin
+        from .attention_dispatch import AttentionBackendName, _AttentionBackendRegistry
+        from .attention_processor import Attention, MochiAttention
+
         if isinstance(config, ContextParallelConfig):
             config = ParallelConfig(context_parallel_config=config)
-
-        if not torch.distributed.is_initialized():
-            raise RuntimeError("torch.distributed must be initialized before calling `enable_parallelism`.")
 
         rank = torch.distributed.get_rank()
         world_size = torch.distributed.get_world_size()
@@ -1503,39 +1534,48 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
         device_module = torch.get_device_module(device_type)
         device = torch.device(device_type, rank % device_module.device_count())
 
-        cp_mesh = None
+        attention_classes = (Attention, MochiAttention, AttentionModuleMixin)
+
+        if config.context_parallel_config is not None:
+            for module in self.modules():
+                if not isinstance(module, attention_classes):
+                    continue
+
+                processor = module.processor
+                if processor is None or not hasattr(processor, "_attention_backend"):
+                    continue
+
+                attention_backend = processor._attention_backend
+                if attention_backend is None:
+                    attention_backend, _ = _AttentionBackendRegistry.get_active_backend()
+                else:
+                    attention_backend = AttentionBackendName(attention_backend)
+
+                if not _AttentionBackendRegistry._is_context_parallel_available(attention_backend):
+                    compatible_backends = sorted(_AttentionBackendRegistry._supports_context_parallel)
+                    raise ValueError(
+                        f"Context parallelism is enabled but the attention processor '{processor.__class__.__name__}' "
+                        f"is using backend '{attention_backend.value}' which does not support context parallelism. "
+                        f"Please set a compatible attention backend: {compatible_backends} using `model.set_attention_backend()` before "
+                        f"calling `model.enable_parallelism()`."
+                    )
+
+                # All modules use the same attention processor and backend. We don't need to
+                # iterate over all modules after checking the first processor
+                break
+
+        mesh = None
         if config.context_parallel_config is not None:
             cp_config = config.context_parallel_config
-            if cp_config.ring_degree < 1 or cp_config.ulysses_degree < 1:
-                raise ValueError("`ring_degree` and `ulysses_degree` must be greater than or equal to 1.")
-            if cp_config.ring_degree > 1 and cp_config.ulysses_degree > 1:
-                raise ValueError(
-                    "Unified Ulysses-Ring attention is not yet supported. Please set either `ring_degree` or `ulysses_degree` to 1."
-                )
-            if cp_config.ring_degree * cp_config.ulysses_degree > world_size:
-                raise ValueError(
-                    f"The product of `ring_degree` ({cp_config.ring_degree}) and `ulysses_degree` ({cp_config.ulysses_degree}) must not exceed the world size ({world_size})."
-                )
-            cp_mesh = torch.distributed.device_mesh.init_device_mesh(
+            mesh = cp_config.mesh or torch.distributed.device_mesh.init_device_mesh(
                 device_type=device_type,
-                mesh_shape=(cp_config.ring_degree, cp_config.ulysses_degree),
-                mesh_dim_names=("ring", "ulysses"),
+                mesh_shape=cp_config.mesh_shape,
+                mesh_dim_names=cp_config.mesh_dim_names,
             )
 
-        config.setup(rank, world_size, device, cp_mesh=cp_mesh)
-
-        if cp_plan is None and self._cp_plan is None:
-            raise ValueError(
-                "`cp_plan` must be provided either as an argument or set in the model's `_cp_plan` attribute."
-            )
-        cp_plan = cp_plan if cp_plan is not None else self._cp_plan
-
-        if config.context_parallel_config is not None:
-            apply_context_parallel(self, config.context_parallel_config, cp_plan)
-
+        config.setup(rank, world_size, device, mesh=mesh)
         self._parallel_config = config
 
-        attention_classes = (Attention, MochiAttention, AttentionModuleMixin)
         for module in self.modules():
             if not isinstance(module, attention_classes):
                 continue
@@ -1544,25 +1584,34 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
                 continue
             processor._parallel_config = config
 
+        if config.context_parallel_config is not None:
+            if cp_plan is None and self._cp_plan is None:
+                raise ValueError(
+                    "`cp_plan` must be provided either as an argument or set in the model's `_cp_plan` attribute."
+                )
+            cp_plan = cp_plan if cp_plan is not None else self._cp_plan
+            apply_context_parallel(self, config.context_parallel_config, cp_plan)
+
     @classmethod
     def _load_pretrained_model(
         cls,
         model,
         state_dict: OrderedDict,
-        resolved_model_file: List[str],
-        pretrained_model_name_or_path: Union[str, os.PathLike],
-        loaded_keys: List[str],
+        resolved_model_file: list[str],
+        pretrained_model_name_or_path: str | os.PathLike,
+        loaded_keys: list[str],
         ignore_mismatched_sizes: bool = False,
         assign_to_params_buffers: bool = False,
-        hf_quantizer: Optional[DiffusersQuantizer] = None,
+        hf_quantizer: DiffusersQuantizer | None = None,
         low_cpu_mem_usage: bool = True,
-        dtype: Optional[Union[str, torch.dtype]] = None,
-        keep_in_fp32_modules: Optional[List[str]] = None,
-        device_map: Union[str, int, torch.device, Dict[str, Union[int, str, torch.device]]] = None,
-        offload_state_dict: Optional[bool] = None,
-        offload_folder: Optional[Union[str, os.PathLike]] = None,
-        dduf_entries: Optional[Dict[str, DDUFEntry]] = None,
-        is_parallel_loading_enabled: Optional[bool] = False,
+        dtype: str | torch.dtype | None = None,
+        keep_in_fp32_modules: list[str] | None = None,
+        device_map: str | int | torch.device | dict[str, str | int | torch.device] = None,
+        offload_state_dict: bool | None = None,
+        offload_folder: str | os.PathLike | None = None,
+        dduf_entries: dict[str, DDUFEntry] | None = None,
+        is_parallel_loading_enabled: bool | None = False,
+        disable_mmap: bool = False,
     ):
         model_state_dict = model.state_dict()
         expected_keys = list(model_state_dict.keys())
@@ -1631,6 +1680,7 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
             state_dict_folder=state_dict_folder,
             ignore_mismatched_sizes=ignore_mismatched_sizes,
             low_cpu_mem_usage=low_cpu_mem_usage,
+            disable_mmap=disable_mmap,
         )
 
         if is_parallel_loading_enabled:
@@ -1640,7 +1690,10 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
         else:
             shard_files = resolved_model_file
             if len(resolved_model_file) > 1:
-                shard_files = logging.tqdm(resolved_model_file, desc="Loading checkpoint shards")
+                shard_tqdm_kwargs = {"desc": "Loading checkpoint shards"}
+                if not is_torch_dist_rank_zero():
+                    shard_tqdm_kwargs["disable"] = True
+                shard_files = logging.tqdm(resolved_model_file, **shard_tqdm_kwargs)
 
             for shard_file in shard_files:
                 offload_index, state_dict_index, _mismatched_keys, _error_msgs = load_fn(shard_file)
@@ -1721,7 +1774,7 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
                 The device map value. Options are ["auto", "balanced", "balanced_low_0", "sequential"]
 
         Returns:
-            `List[str]`: List of modules that should not be split
+            `list[str]`: list of modules that should not be split
         """
         _no_split_modules = set()
         modules_to_check = [self]
@@ -1800,7 +1853,7 @@ class ModelMixin(torch.nn.Module, PushToHubMixin):
         ```py
         from diffusers import UNet2DConditionModel
 
-        model_id = "runwayml/stable-diffusion-v1-5"
+        model_id = "stable-diffusion-v1-5/stable-diffusion-v1-5"
         unet = UNet2DConditionModel.from_pretrained(model_id, subfolder="unet")
         unet.num_parameters(only_trainable=True)
         859520964
@@ -1942,7 +1995,7 @@ class LegacyModelMixin(ModelMixin):
 
     @classmethod
     @validate_hf_hub_args
-    def from_pretrained(cls, pretrained_model_name_or_path: Optional[Union[str, os.PathLike]], **kwargs):
+    def from_pretrained(cls, pretrained_model_name_or_path: str | os.PathLike | None, **kwargs):
         # To prevent dependency import problem.
         from .model_loading_utils import _fetch_remapped_cls_from_config
 

@@ -12,8 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 import math
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -58,15 +60,16 @@ class AdaptiveProjectedGuidance(BaseGuidance):
     def __init__(
         self,
         guidance_scale: float = 7.5,
-        adaptive_projected_guidance_momentum: Optional[float] = None,
+        adaptive_projected_guidance_momentum: float | None = None,
         adaptive_projected_guidance_rescale: float = 15.0,
         eta: float = 1.0,
         guidance_rescale: float = 0.0,
         use_original_formulation: bool = False,
         start: float = 0.0,
         stop: float = 1.0,
+        enabled: bool = True,
     ):
-        super().__init__(start, stop)
+        super().__init__(start, stop, enabled)
 
         self.guidance_scale = guidance_scale
         self.adaptive_projected_guidance_momentum = adaptive_projected_guidance_momentum
@@ -76,23 +79,31 @@ class AdaptiveProjectedGuidance(BaseGuidance):
         self.use_original_formulation = use_original_formulation
         self.momentum_buffer = None
 
-    def prepare_inputs(
-        self, data: "BlockState", input_fields: Optional[Dict[str, Union[str, Tuple[str, str]]]] = None
-    ) -> List["BlockState"]:
-        if input_fields is None:
-            input_fields = self._input_fields
-
+    def prepare_inputs(self, data: dict[str, tuple[torch.Tensor, torch.Tensor]]) -> list["BlockState"]:
         if self._step == 0:
             if self.adaptive_projected_guidance_momentum is not None:
                 self.momentum_buffer = MomentumBuffer(self.adaptive_projected_guidance_momentum)
         tuple_indices = [0] if self.num_conditions == 1 else [0, 1]
         data_batches = []
-        for i in range(self.num_conditions):
-            data_batch = self._prepare_batch(input_fields, data, tuple_indices[i], self._input_predictions[i])
+        for tuple_idx, input_prediction in zip(tuple_indices, self._input_predictions):
+            data_batch = self._prepare_batch(data, tuple_idx, input_prediction)
             data_batches.append(data_batch)
         return data_batches
 
-    def forward(self, pred_cond: torch.Tensor, pred_uncond: Optional[torch.Tensor] = None) -> GuiderOutput:
+    def prepare_inputs_from_block_state(
+        self, data: "BlockState", input_fields: dict[str, str | tuple[str, str]]
+    ) -> list["BlockState"]:
+        if self._step == 0:
+            if self.adaptive_projected_guidance_momentum is not None:
+                self.momentum_buffer = MomentumBuffer(self.adaptive_projected_guidance_momentum)
+        tuple_indices = [0] if self.num_conditions == 1 else [0, 1]
+        data_batches = []
+        for tuple_idx, input_prediction in zip(tuple_indices, self._input_predictions):
+            data_batch = self._prepare_batch_from_block_state(input_fields, data, tuple_idx, input_prediction)
+            data_batches.append(data_batch)
+        return data_batches
+
+    def forward(self, pred_cond: torch.Tensor, pred_uncond: torch.Tensor | None = None) -> GuiderOutput:
         pred = None
 
         if not self._is_apg_enabled():
@@ -152,12 +163,50 @@ class MomentumBuffer:
         new_average = self.momentum * self.running_average
         self.running_average = update_value + new_average
 
+    def __repr__(self) -> str:
+        """
+        Returns a string representation showing momentum, shape, statistics, and a slice of the running_average.
+        """
+        if isinstance(self.running_average, torch.Tensor):
+            shape = tuple(self.running_average.shape)
+
+            # Calculate statistics
+            with torch.no_grad():
+                stats = {
+                    "mean": self.running_average.mean().item(),
+                    "std": self.running_average.std().item(),
+                    "min": self.running_average.min().item(),
+                    "max": self.running_average.max().item(),
+                }
+
+            # Get a slice (max 3 elements per dimension)
+            slice_indices = tuple(slice(None, min(3, dim)) for dim in shape)
+            sliced_data = self.running_average[slice_indices]
+
+            # Format the slice for display (convert to float32 for numpy compatibility with bfloat16)
+            slice_str = str(sliced_data.detach().float().cpu().numpy())
+            if len(slice_str) > 200:  # Truncate if too long
+                slice_str = slice_str[:200] + "..."
+
+            stats_str = ", ".join([f"{k}={v:.4f}" for k, v in stats.items()])
+
+            return (
+                f"MomentumBuffer(\n"
+                f"  momentum={self.momentum},\n"
+                f"  shape={shape},\n"
+                f"  stats=[{stats_str}],\n"
+                f"  slice={slice_str}\n"
+                f")"
+            )
+        else:
+            return f"MomentumBuffer(momentum={self.momentum}, running_average={self.running_average})"
+
 
 def normalized_guidance(
     pred_cond: torch.Tensor,
     pred_uncond: torch.Tensor,
     guidance_scale: float,
-    momentum_buffer: Optional[MomentumBuffer] = None,
+    momentum_buffer: MomentumBuffer | None = None,
     eta: float = 1.0,
     norm_threshold: float = 0.0,
     use_original_formulation: bool = False,
