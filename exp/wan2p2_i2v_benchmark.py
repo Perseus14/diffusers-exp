@@ -303,18 +303,6 @@ def _tpu_custom_attention(query, key, value, mesh, scale=None):
         q_partition_spec = P(dp_mesh_key, None, remain_mesh_key, None)
         kv_partition_spec = P(dp_mesh_key, None, None, None)
 
-    print(f"\n{'='*20} TPU ATTENTION SHARDING DEBUG {'='*20}")
-    print(f"| {'Variable':<20} | {'Value':<40} |")
-    print(f"|{'-'*22}|{'-'*42}|")
-    print(f"| Query Seq Len      | {q_seq_len:<40} |")
-    print(f"| KV Seq Len         | {kv_seq_len:<40} |")
-    print(f"| Heads (Q/KV)       | {q_num_head:<19} / {kv_num_head:<18} |")
-    print(f"| Device Mesh Prod   | {remain_devices_prod:<40} |")
-    print(f"|{'-'*22}|{'-'*42}|")
-    print(f"| Q PartitionSpec    | {str(q_partition_spec):<40} |")
-    print(f"| KV PartitionSpec   | {str(kv_partition_spec):<40} |")
-    print(f"{'='*70}\n")
-
     sharded_fn = jax.shard_map(
         _attention_on_slices,
         mesh=mesh,
