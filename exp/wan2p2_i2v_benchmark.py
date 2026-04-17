@@ -71,7 +71,7 @@ DEFAULT_PROFILE_OUT_PATH = "/tmp/wan_prof"
 
 # fmt: off
 TEXT_ENCODER_SHARDINGS = {
-    'shared.weight': ('tp',), 
+    'shared.weight': (), 
     'encoder.block.*.layer.*.SelfAttention.q.weight': ('tp',), 
     'encoder.block.*.layer.*.SelfAttention.k.weight': ('tp',), 
     'encoder.block.*.layer.*.SelfAttention.v.weight': ('tp',), 
