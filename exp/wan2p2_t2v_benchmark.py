@@ -275,7 +275,7 @@ def _tpu_custom_attention(query, key, value, mesh, scale=None):
 
         q_partition_spec = P(dp_mesh_key, None, remain_mesh_key, None)
         kv_partition_spec = P(dp_mesh_key, None, None, None)
-    
+
     sharded_fn = jax.shard_map(
         _attention_on_slices,
         mesh=mesh,
@@ -283,10 +283,10 @@ def _tpu_custom_attention(query, key, value, mesh, scale=None):
         out_specs=q_partition_spec,
         check_vma=False,
     )
-    query = jax.lax.with_sharding_constraint(query, P(dp_mesh_key, None, remain_mesh_key, None))
-    key = jax.lax.with_sharding_constraint(key, P(dp_mesh_key, None, remain_mesh_key, None))
-    value = jax.lax.with_sharding_constraint(value, P(dp_mesh_key, None, remain_mesh_key, None))
-    
+    query = jax.lax.with_sharding_constraint(query, q_partition_spec)
+    key = jax.lax.with_sharding_constraint(key, kv_partition_spec)
+    value = jax.lax.with_sharding_constraint(value, kv_partition_spec)
+
     out = sharded_fn(query, key, value)
     out = out[:, :, :q_seq_len, :]
     out = jax.lax.with_sharding_constraint(out, P(dp_mesh_key, None, remain_mesh_key, None))
