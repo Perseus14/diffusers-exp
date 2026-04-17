@@ -36,7 +36,7 @@ from torchax.ops import jtorch
 from torchax.ops import ops_registry
 
 # Local file
-import custom_splash_attention_updated as custom_splash_attention
+import custom_splash_attention as custom_splash_attention
 
 SIZE_CONFIGS = {
     "720*1280": (720, 1280),
@@ -237,7 +237,7 @@ def _tpu_custom_attention(query, key, value, mesh, scale=None):
             splash_kernel = custom_splash_attention.make_splash_mha(
                 block_sizes=block_sizes, 
                 bkv_compute_in=BKVCOMPUTEINSIZE,
-                heads_per_tile=HEADS_PER_TILE
+                #heads_per_tile=HEADS_PER_TILE
             )
             out = splash_kernel(q_3d, k_3d, v_3d).astype(q_3d.dtype)
             out = jnp.swapaxes(out, 1, 2)
