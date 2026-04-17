@@ -35,4 +35,4 @@ export LIBTPU_INIT_ARGS='--xla_tpu_dvfs_p_state=7 \
 --xla_tpu_assign_all_reduce_scatter_layout=true' && \
 export HF_HUB_CACHE=/dev/shm/maxdiffusion_hf_cache/ && \
 export HF_HUB_ENABLE_HF_TRANSFER=1 && \
-HF_HUB_CACHE=/dev/shm python wan2p2_t2v_benchmark.py --size 720*1280 --batch_size 1 --dp 2 --bq 4864 --bkv 1024 --bkv_compute 1024 --heads_per_tile 2 --frame_num 81
+HF_HUB_CACHE=/dev/shm python wan2p2_t2v_benchmark.py --size 720*1280 --batch_size 1 --dp 2 --bq 4864 --bkv 1024 --bkv_compute 1024 --heads_per_tile 1 --frame_num 81

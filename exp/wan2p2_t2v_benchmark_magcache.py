@@ -36,7 +36,7 @@ from torchax.ops import jtorch
 from torchax.ops import ops_registry
 
 # Local file
-import custom_splash_attention_modified as custom_splash_attention
+import custom_splash_attention_updated as custom_splash_attention
 
 SIZE_CONFIGS = {
     "720*1280": (720, 1280),
@@ -226,13 +226,15 @@ def _tpu_custom_attention(query, key, value, mesh, scale=None):
             q_seq_len = q_3d.shape[1]
             kv_seq_len = k_3d.shape[1]
             num_heads_on_device = q_3d.shape[0]
-            block_sizes = splash_attention.BlockSizes(
+            block_sizes = custom_splash_attention._BlockSizes(
                 block_q=min(BQSIZE, q_seq_len),
                 block_kv=min(BKVSIZE, kv_seq_len),
                 block_kv_compute=min(BKVCOMPUTESIZE, kv_seq_len),
             )
             splash_kernel = custom_splash_attention.make_splash_mha(
-                block_sizes=block_sizes, bkv_compute_in=BKVCOMPUTEINSIZE
+                block_sizes=block_sizes,
+                bkv_compute_in=BKVCOMPUTEINSIZE,
+                heads_per_tile=HEADS_PER_TILE
             )
             out = splash_kernel(q_3d, k_3d, v_3d).astype(q_3d.dtype)
             out = jnp.swapaxes(out, 1, 2)
@@ -453,6 +455,7 @@ def parse_args():
     parser.add_argument("--bkv_compute", type=int, default=1024, help="Compute block size for Splash Attention")
     parser.add_argument("--bkv_compute_in", type=int, default=1024, help="Input block size for Splash Attention")
     parser.add_argument("--FLAG", action="store_true", help="Sets head sharding")
+    parser.add_argument("--heads_per_tile", type=int, default=1, help="MHPT: Heads per tile for MXU/VPU overlap")
 
     return parser.parse_args(namespace=Args())
 
@@ -839,11 +842,12 @@ class TransformerShardingWrapper:
         return self.compiled_transformer(**new_kwargs)
 
 def main(args: Args):
-    global BQSIZE, BKVSIZE, BKVCOMPUTESIZE, BKVCOMPUTEINSIZE
+    global BQSIZE, BKVSIZE, BKVCOMPUTESIZE, BKVCOMPUTEINSIZE, HEADS_PER_TILE
     BQSIZE = args.bq
     BKVSIZE = args.bkv
     BKVCOMPUTESIZE = args.bkv_compute
     BKVCOMPUTEINSIZE = args.bkv_compute_in
+    HEADS_PER_TILE = args.heads_per_tile
     torch.set_default_dtype(torch.bfloat16)
 
     model_id = "Wan-AI/Wan2.2-T2V-A14B-Diffusers" 
