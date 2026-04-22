@@ -1,4 +1,15 @@
-# Wan-AI/Wan2.2-I2V-A14B-Diffusers Recipe
+# Wan-AI/Wan2.2-T2V-A14B-Diffusers Recipe for 7x
+
+
+Run the following command
+
+```
+source install.sh
+source bash.sh
+```
+
+
+# Wan-AI/Wan2.2-I2V-A14B-Diffusers Recipe for v6e (Outdated)
 
 1. Export the environment of GCP project
 * Fill the PROJECT_ID and TPU_NAME
@@ -154,16 +165,4 @@ python wan2p2_benchmark.py
 
 # v6e-16
 # Benchmark:  94.497410s
-```
-
-
-
-# Wan-AI/Wan2.2-T2V-A14B-Diffusers Recipe
-
-
-Run the following command
-
-```
-source install.sh
-source bash.sh
 ```
