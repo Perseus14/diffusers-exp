@@ -306,8 +306,8 @@ def _scaled_dot_product_attention(
     env,
     mesh,
 ) -> torch.Tensor:
-    # Please change based on seq length, this is randomly chosen
-    if key.shape[2] > 10000:
+    # Please change based on seq length and VAE tokens, this is randomly chosen
+    if key.shape[2] > 20000:
         assert attn_mask is None
         assert dropout_p == 0.0
         assert is_causal is False
