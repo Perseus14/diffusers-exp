@@ -37,6 +37,9 @@ from torchax.ops import ops_registry
 
 # Local file
 import custom_splash_attention_updated as custom_splash_attention
+from diffusers.models.transformers.transformer_wan import WanAttnProcessor, _get_qkv_projections, _get_added_kv_projections
+from diffusers.models.attention_dispatch import dispatch_attention_fn
+
 
 SIZE_CONFIGS = {
     "720*1280": (720, 1280),
@@ -149,7 +152,82 @@ def perf_time(name: str):
     print(f"{name}: {end - start: .6f}s")
 
 
+def _fast_rotary_call(self_proc, attn, hidden_states,
+                      encoder_hidden_states=None,
+                      attention_mask=None, rotary_emb=None,
+                      cross_attn_kv_cache=None, **kwargs):
+    """WanAttnProcessor.__call__ with RoPE opt + Q-first pipelining."""
+    encoder_hidden_states_img = None
+    if attn.add_k_proj is not None:
+        image_context_length = encoder_hidden_states.shape[1] - 512
+        encoder_hidden_states_img = encoder_hidden_states[:, :image_context_length]
+        encoder_hidden_states = encoder_hidden_states[:, image_context_length:]
+
+    if cross_attn_kv_cache is not None:
+        key, value = cross_attn_kv_cache[:2]
+        query = attn.to_q(hidden_states)
+        query = attn.norm_q(query)
+        query = query.unflatten(2, (attn.heads, -1))
+    else:
+        query, key, value = _get_qkv_projections(attn, hidden_states, encoder_hidden_states)
+        query = attn.norm_q(query)
+        key = attn.norm_k(key)
+
+        query = query.unflatten(2, (attn.heads, -1))
+        key = key.unflatten(2, (attn.heads, -1))
+        value = value.unflatten(2, (attn.heads, -1))
+
+    if rotary_emb is not None:
+        def _apply_rotary_emb_complex(x, freqs_cos, freqs_sin):
+            x_complex = torch.view_as_complex(x.unflatten(-1, (-1, 2)))
+            cos = freqs_cos.unflatten(-1, (-1, 2))[..., 0]
+            sin = freqs_sin.unflatten(-1, (-1, 2))[..., 0]
+            freqs_complex = torch.view_as_complex(torch.stack([cos, sin], dim=-1))
+            out_complex = x_complex * freqs_complex
+            return torch.view_as_real(out_complex).flatten(-2).type_as(x)
+
+        query = _apply_rotary_emb_complex(query, *rotary_emb)
+        if cross_attn_kv_cache is None:
+            key = _apply_rotary_emb_complex(key, *rotary_emb)
+
+
+    hidden_states_img = None
+    if encoder_hidden_states_img is not None or (cross_attn_kv_cache is not None and len(cross_attn_kv_cache) == 4):
+        if cross_attn_kv_cache is None or len(cross_attn_kv_cache) != 4:
+            key_img, value_img = _get_added_kv_projections(attn, encoder_hidden_states_img)
+            key_img = attn.norm_added_k(key_img)
+            key_img = key_img.unflatten(2, (attn.heads, -1))
+            value_img = value_img.unflatten(2, (attn.heads, -1))
+        else:
+            key_img, value_img = cross_attn_kv_cache[2:]
+            
+        hidden_states_img = dispatch_attention_fn(
+            query, key_img, value_img,
+            attn_mask=None, dropout_p=0.0, is_causal=False,
+            backend=self_proc._attention_backend,
+            parallel_config=None,
+        )
+        hidden_states_img = hidden_states_img.flatten(2, 3).type_as(query)
+
+    hidden_states = dispatch_attention_fn(
+        query, key, value,
+        attn_mask=attention_mask, dropout_p=0.0, is_causal=False,
+        backend=self_proc._attention_backend,
+        parallel_config=(self_proc._parallel_config if encoder_hidden_states is None else None),
+    )
+    hidden_states = hidden_states.flatten(2, 3).type_as(query)
+
+    if hidden_states_img is not None:
+        hidden_states = hidden_states + hidden_states_img
+
+    hidden_states = attn.to_out[0](hidden_states)
+    hidden_states = attn.to_out[1](hidden_states)
+    return hidden_states
+
+
+
 def _print_weights(module):
+
     def make_key(name):
         return re.sub(r"\.\d+\.", ".*.", name)
 
@@ -578,7 +656,12 @@ def main(args: Args):
     model_id = "Wan-AI/Wan2.2-T2V-A14B-Diffusers" 
     dtype = torch.bfloat16
 
+    # ---- RoPE optimization: stack+flatten instead of strided scatter ----
+    WanAttnProcessor.__call__ = _fast_rotary_call
+    print("RoPE optimized: stack+flatten replaces strided scatter")
+
     with perf_time("load pipe"):
+
         pipe = WanPipeline.from_pretrained(model_id, torch_dtype=dtype, boundary_ratio=0.875)
 
     if args.print_weights:
@@ -641,7 +724,13 @@ def main(args: Args):
                             j_attention_mask = jax.device_put(j_attention_mask, sharding)
                             
                     t_input_ids, t_attention_mask = env.j2t_iso((j_input_ids, j_attention_mask))
-                    return self.compiled_encoder(t_input_ids, attention_mask=t_attention_mask, **kwargs)
+                    with perf_time("Text Encoder Execution"):
+                        res = self.compiled_encoder(t_input_ids, attention_mask=t_attention_mask, **kwargs)
+                        import torch_xla.core.xla_model as xm
+                        xm.mark_step()
+                        return res
+
+
 
             pipe.text_encoder = TextEncoderShardingWrapper(compiled_text_encoder)
             
@@ -702,6 +791,8 @@ def main(args: Args):
                 new_kwargs['guidance_scale'] = float(guidance_scale)
                 
                 return self.compiled_transformer(**new_kwargs)
+
+
 
         with perf_time("  Move transformer"):
             # Strip Dropout for Identity to clean the XLA graph
@@ -814,7 +905,10 @@ def main(args: Args):
             
             # 4. Override the pipeline's decode method to use our compiled graph directly!
             def custom_vae_decode(z, return_dict=False):
-                out = compiled_vae_decoder(z)
+                with perf_time("VAE Decode Execution"):
+                    out = compiled_vae_decoder(z)
+                    import torch_xla.core.xla_model as xm
+                    xm.mark_step()
                 if not return_dict:
                     return (out,)
                 return DecoderOutput(sample=out)
