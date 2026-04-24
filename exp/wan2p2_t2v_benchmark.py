@@ -8,6 +8,9 @@ os.environ['JAX_CPP_MIN_LOG_LEVEL'] = '3'
 import warnings
 warnings.filterwarnings("ignore", message=".*Explicitly requested dtype int64 requested.*")
 
+import warnings
+warnings.filterwarnings("ignore", message=".*Explicitly requested dtype int64 requested.*")
+
 import argparse
 
 from datetime import datetime
@@ -730,13 +733,8 @@ def main(args: Args):
                     t_input_ids, t_attention_mask = env.j2t_iso((j_input_ids, j_attention_mask))
                     with perf_time("Text Encoder Execution"):
                         res = self.compiled_encoder(t_input_ids, attention_mask=t_attention_mask, **kwargs)
-                        env.t2j_iso(res).block_until_ready()
+                        env.t2j_iso(res.last_hidden_state).block_until_ready()
                         return res
-
-
-
-
-
             pipe.text_encoder = TextEncoderShardingWrapper(compiled_text_encoder)
             
         transformer_options = torchax.CompileOptions(
