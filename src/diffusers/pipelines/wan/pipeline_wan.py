@@ -13,7 +13,9 @@
 # limitations under the License.
 
 import html
+import time
 from typing import Any, Callable
+
 
 import regex as re
 import torch
@@ -658,7 +660,10 @@ class WanPipeline(DiffusionPipeline, WanLoraLoaderMixin):
         else:
             boundary_timestep = None
 
+        print("Diffusion loop start")
+        loop_start = time.perf_counter()
         with self.progress_bar(total=num_inference_steps) as progress_bar:
+
             for i, t in enumerate(timesteps):
                 if self.interrupt:
                     continue
@@ -739,7 +744,10 @@ class WanPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                 if XLA_AVAILABLE:
                     xm.mark_step()
 
+        loop_end = time.perf_counter()
+        print(f"Diffusion loop took: {loop_end - loop_start: .6f}s")
         self._current_timestep = None
+
 
         if not output_type == "latent":
             latents = latents.to(self.vae.dtype)
