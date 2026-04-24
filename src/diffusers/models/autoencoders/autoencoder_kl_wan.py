@@ -36,6 +36,33 @@ logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 CACHE_T = 2
 
 
+def _update_cache(cache, idx, value):
+  """Immutable cache update: returns new tuple with value at idx."""
+  if cache is None:
+    return None
+  cache = tuple(cache)
+  return cache[:idx] + (value,) + cache[idx + 1 :]
+
+
+def _is_sentinel(x):
+  """Check if x is a sentinel tensor (1D, single element) vs real cache (5D)."""
+  return x is not None and x.dim() == 1 and x.shape[0] == 1
+
+
+def _make_sentinel(x):
+  """Create a sentinel tensor compatible with JIT tracing."""
+  return torch.zeros(1, device=x.device, dtype=x.dtype)
+
+
+def _apply_sharding(x, sharding):
+  """Apply spatial sharding constraint, handling both Tensor and View."""
+  if not hasattr(x, "shard_"):
+    x = x.clone()
+  x.shard_(sharding)
+  return x
+
+
+
 class AvgDown3D(nn.Module):
     def __init__(
         self,
@@ -295,29 +322,43 @@ class WanResample(nn.Module):
         else:
             self.resample = nn.Identity()
 
-    def forward(self, x, feat_cache=None, feat_idx=[0]):
+    def forward(self, x, feat_cache=None, feat_idx=0):
         b, c, t, h, w = x.size()
-        if self.mode == "upsample3d":
+        if self.mode == "upsample3d" and hasattr(self, "time_conv"):
             if feat_cache is not None:
                 idx = feat_idx
-                # (None,) for "Rep" to trace the abstract array
                 if feat_cache[idx] is None:
-                    feat_cache[idx] = (None,)
+                    feat_cache = _update_cache(feat_cache, idx, _make_sentinel(x))
                     feat_idx += 1
                 else:
                     cache_x = x[:, :, -CACHE_T:, :, :].clone()
-                    if cache_x.shape[2] < 2 and feat_cache[idx] is not None and feat_cache[idx][0] is not None:
-                        # cache last frame of last two chunk
+                    if (
+                        cache_x.shape[2] < 2
+                        and feat_cache[idx] is not None
+                        and not _is_sentinel(feat_cache[idx])
+                    ):
                         cache_x = torch.cat(
-                            [feat_cache[idx][0][:, :, -1, :, :].unsqueeze(2).to(cache_x.device), cache_x], dim=2
+                            [
+                                feat_cache[idx][:, :, -1, :, :]
+                                .unsqueeze(2)
+                                .to(cache_x.device),
+                                cache_x,
+                            ],
+                            dim=2,
                         )
-                    if cache_x.shape[2] < 2 and feat_cache[idx] is not None and feat_cache[idx][0] is None:
-                        cache_x = torch.cat([torch.zeros_like(cache_x).to(cache_x.device), cache_x], dim=2)
-                    if feat_cache[idx][0] is None:
+                    if (
+                        cache_x.shape[2] < 2
+                        and feat_cache[idx] is not None
+                        and _is_sentinel(feat_cache[idx])
+                    ):
+                        cache_x = torch.cat(
+                            [torch.zeros_like(cache_x).to(cache_x.device), cache_x], dim=2
+                        )
+                    if _is_sentinel(feat_cache[idx]):
                         x = self.time_conv(x)
                     else:
-                        x = self.time_conv(x, feat_cache[idx][0])
-                    feat_cache[idx] = (cache_x,)
+                        x = self.time_conv(x, feat_cache[idx])
+                    feat_cache = _update_cache(feat_cache, idx, cache_x)
                     feat_idx += 1
 
                     x = x.reshape(b, 2, c, t, h, w)
@@ -328,18 +369,19 @@ class WanResample(nn.Module):
         x = self.resample(x)
         x = x.view(b, t, x.size(1), x.size(2), x.size(3)).permute(0, 2, 1, 3, 4)
 
-        if self.mode == "downsample3d":
+        if self.mode == "downsample3d" and hasattr(self, "time_conv"):
             if feat_cache is not None:
                 idx = feat_idx
                 if feat_cache[idx] is None:
-                    feat_cache[idx] = x.clone()
+                    feat_cache = _update_cache(feat_cache, idx, x.clone())
                     feat_idx += 1
                 else:
                     cache_x = x[:, :, -1:, :, :].clone()
                     x = self.time_conv(torch.cat([feat_cache[idx][:, :, -1:, :, :], x], 2))
-                    feat_cache[idx] = cache_x
+                    feat_cache = _update_cache(feat_cache, idx, cache_x)
                     feat_idx += 1
-        return x, feat_idx, feat_cache
+        return x, feat_cache, feat_idx
+
 
 
 class WanResidualBlock(nn.Module):
@@ -373,7 +415,7 @@ class WanResidualBlock(nn.Module):
         self.conv2 = WanCausalConv3d(out_dim, out_dim, 3, padding=1)
         self.conv_shortcut = WanCausalConv3d(in_dim, out_dim, 1) if in_dim != out_dim else nn.Identity()
 
-    def forward(self, x, feat_cache=None, feat_idx=[0]):
+    def forward(self, x, feat_cache=None, feat_idx=0):
         # Apply shortcut connection
         h = self.conv_shortcut(x)
 
@@ -388,7 +430,7 @@ class WanResidualBlock(nn.Module):
                 cache_x = torch.cat([feat_cache[idx][:, :, -1, :, :].unsqueeze(2).to(cache_x.device), cache_x], dim=2)
 
             x = self.conv1(x, feat_cache[idx])
-            feat_cache[idx] = cache_x
+            feat_cache = _update_cache(feat_cache, idx, cache_x)
             feat_idx += 1
         else:
             x = self.conv1(x)
@@ -407,13 +449,14 @@ class WanResidualBlock(nn.Module):
                 cache_x = torch.cat([feat_cache[idx][:, :, -1, :, :].unsqueeze(2).to(cache_x.device), cache_x], dim=2)
 
             x = self.conv2(x, feat_cache[idx])
-            feat_cache[idx] = cache_x
+            feat_cache = _update_cache(feat_cache, idx, cache_x)
             feat_idx += 1
         else:
             x = self.conv2(x)
 
         # Add residual connection
-        return x + h, feat_idx, feat_cache
+        return x + h, feat_cache, feat_idx
+
 
 
 class WanAttentionBlock(nn.Module):
@@ -486,18 +529,19 @@ class WanMidBlock(nn.Module):
 
         self.gradient_checkpointing = False
 
-    def forward(self, x, feat_cache=None, feat_idx=[0]):
+    def forward(self, x, feat_cache=None, feat_idx=0):
         # First residual block
-        x, feat_idx, feat_cache = self.resnets[0](x, feat_cache, feat_idx)
+        x, feat_cache, feat_idx = self.resnets[0](x, feat_cache, feat_idx)
 
         # Process through attention and residual blocks
         for attn, resnet in zip(self.attentions, self.resnets[1:]):
             if attn is not None:
                 x = attn(x)
 
-            x, feat_idx, feat_cache = resnet(x, feat_cache, feat_idx)
+            x, feat_cache, feat_idx = resnet(x, feat_cache, feat_idx)
 
-        return x, feat_idx, feat_cache
+        return x, feat_cache, feat_idx
+
 
 
 class WanResidualDownBlock(nn.Module):
@@ -526,14 +570,15 @@ class WanResidualDownBlock(nn.Module):
         else:
             self.downsampler = None
 
-    def forward(self, x, feat_cache=None, feat_idx=[0]):
+    def forward(self, x, feat_cache=None, feat_idx=0):
         x_copy = x.clone()
         for resnet in self.resnets:
-            x, feat_idx, feat_cache = resnet(x, feat_cache, feat_idx)
+            x, feat_cache, feat_idx = resnet(x, feat_cache, feat_idx)
         if self.downsampler is not None:
-            x, feat_idx, feat_cache = self.downsampler(x, feat_cache, feat_idx)
+            x, feat_cache, feat_idx = self.downsampler(x, feat_cache, feat_idx)
 
-        return x + self.avg_shortcut(x_copy), feat_idx, feat_cache
+        return x + self.avg_shortcut(x_copy), feat_cache, feat_idx
+
 
 
 class WanEncoder3d(nn.Module):
@@ -619,14 +664,17 @@ class WanEncoder3d(nn.Module):
 
     def forward(self, x, feat_cache=None):
         feat_idx = 0
+
+        if hasattr(self, "_spatial_sharding"):
+            x = _apply_sharding(x, self._spatial_sharding)
+
         if feat_cache is not None:
             idx = feat_idx
             cache_x = x[:, :, -CACHE_T:, :, :].clone()
             if cache_x.shape[2] < 2 and feat_cache[idx] is not None:
-                # cache last frame of last two chunk
                 cache_x = torch.cat([feat_cache[idx][:, :, -1, :, :].unsqueeze(2).to(cache_x.device), cache_x], dim=2)
             x = self.conv_in(x, feat_cache[idx])
-            feat_cache[idx] = cache_x
+            feat_cache = _update_cache(feat_cache, idx, cache_x)
             feat_idx += 1
         else:
             x = self.conv_in(x)
@@ -634,12 +682,16 @@ class WanEncoder3d(nn.Module):
         ## downsamples
         for layer in self.down_blocks:
             if feat_cache is not None:
-                x, feat_idx, feat_cache = layer(x, feat_cache, feat_idx)
+                x, feat_cache, feat_idx = layer.forward(x, feat_cache=feat_cache, feat_idx=feat_idx)
             else:
-                x, _, _ = layer(x)
+                x = layer(x)
+            if hasattr(self, "_spatial_sharding"):
+                x = _apply_sharding(x, self._spatial_sharding)
 
         ## middle
-        x, feat_idx, feat_cache = self.mid_block(x, feat_cache, feat_idx)
+        x, feat_cache, feat_idx = self.mid_block.forward(x, feat_cache=feat_cache, feat_idx=feat_idx)
+        if hasattr(self, "_spatial_sharding"):
+            x = _apply_sharding(x, self._spatial_sharding)
 
         ## head
         x = self.norm_out(x)
@@ -648,14 +700,18 @@ class WanEncoder3d(nn.Module):
             idx = feat_idx
             cache_x = x[:, :, -CACHE_T:, :, :].clone()
             if cache_x.shape[2] < 2 and feat_cache[idx] is not None:
-                # cache last frame of last two chunk
                 cache_x = torch.cat([feat_cache[idx][:, :, -1, :, :].unsqueeze(2).to(cache_x.device), cache_x], dim=2)
             x = self.conv_out(x, feat_cache[idx])
-            feat_cache[idx] = cache_x
+            feat_cache = _update_cache(feat_cache, idx, cache_x)
             feat_idx += 1
         else:
             x = self.conv_out(x)
-        return x, feat_cache
+
+        if hasattr(self, "_spatial_sharding"):
+            x = _apply_sharding(x, self._spatial_sharding)
+
+        return x, feat_cache, feat_idx
+
 
 
 class WanResidualUpBlock(nn.Module):
@@ -789,7 +845,7 @@ class WanUpBlock(nn.Module):
 
         self.gradient_checkpointing = False
 
-    def forward(self, x, feat_cache=None, feat_idx=[0], first_chunk=None):
+    def forward(self, x, feat_cache=None, feat_idx=0, first_chunk=None):
         """
         Forward pass through the upsampling block.
 
@@ -803,16 +859,17 @@ class WanUpBlock(nn.Module):
         """
         for resnet in self.resnets:
             if feat_cache is not None:
-                x, feat_idx, feat_cache = resnet(x, feat_cache, feat_idx)
+                x, feat_cache, feat_idx = resnet.forward(x, feat_cache=feat_cache, feat_idx=feat_idx)
             else:
-                x, _ = resnet(x)
+                x = resnet(x)
 
         if self.upsamplers is not None:
             if feat_cache is not None:
-                x, feat_idx, feat_cache = self.upsamplers[0](x, feat_cache, feat_idx)
+                x, feat_cache, feat_idx = self.upsamplers[0].forward(x, feat_cache=feat_cache, feat_idx=feat_idx)
             else:
-                x, _ = self.upsamplers[0](x)
-        return x, feat_idx, feat_cache
+                x = self.upsamplers[0](x)
+        return x, feat_cache, feat_idx
+
 
 
 class WanDecoder3d(nn.Module):
@@ -908,25 +965,32 @@ class WanDecoder3d(nn.Module):
 
     def forward(self, x, feat_cache=None, first_chunk=False):
         feat_idx = 0
+
+        if hasattr(self, "_spatial_sharding"):
+            x = _apply_sharding(x, self._spatial_sharding)
+
         ## conv1
         if feat_cache is not None:
             idx = feat_idx
             cache_x = x[:, :, -CACHE_T:, :, :].clone()
             if cache_x.shape[2] < 2 and feat_cache[idx] is not None:
-                # cache last frame of last two chunk
                 cache_x = torch.cat([feat_cache[idx][:, :, -1, :, :].unsqueeze(2).to(cache_x.device), cache_x], dim=2)
             x = self.conv_in(x, feat_cache[idx])
-            feat_cache[idx] = cache_x
+            feat_cache = _update_cache(feat_cache, idx, cache_x)
             feat_idx += 1
         else:
             x = self.conv_in(x)
 
         ## middle
-        x, feat_idx, feat_cache = self.mid_block(x, feat_cache, feat_idx)
+        x, feat_cache, feat_idx = self.mid_block.forward(x, feat_cache=feat_cache, feat_idx=feat_idx)
+        if hasattr(self, "_spatial_sharding"):
+            x = _apply_sharding(x, self._spatial_sharding)
 
         ## upsamples
         for up_block in self.up_blocks:
-            x, feat_idx, feat_cache = up_block(x, feat_cache, feat_idx, first_chunk=first_chunk)
+            x, feat_cache, feat_idx = up_block.forward(x, feat_cache=feat_cache, feat_idx=feat_idx, first_chunk=first_chunk)
+            if hasattr(self, "_spatial_sharding"):
+                x = _apply_sharding(x, self._spatial_sharding)
 
         ## head
         x = self.norm_out(x)
@@ -935,18 +999,20 @@ class WanDecoder3d(nn.Module):
             idx = feat_idx
             cache_x = x[:, :, -CACHE_T:, :, :].clone()
             if cache_x.shape[2] < 2 and feat_cache[idx] is not None:
-                # cache last frame of last two chunk
                 cache_x = torch.cat([feat_cache[idx][:, :, -1, :, :].unsqueeze(2).to(cache_x.device), cache_x], dim=2)
             x = self.conv_out(x, feat_cache[idx])
-            feat_cache[idx] = cache_x
+            feat_cache = _update_cache(feat_cache, idx, cache_x)
             feat_idx += 1
         else:
             x = self.conv_out(x)
 
-        # Replicate back to every devices, for the video processing after decode
-        # With multihost, if the data still in other host, there is non-addressable devices error.
-        x = mark_sharding(x, P())
-        return x, feat_cache
+        if hasattr(self, "_spatial_sharding"):
+            x = _apply_sharding(x, self._spatial_sharding)
+        else:
+            x = mark_sharding(x, P())
+
+        return x, feat_cache, feat_idx
+
 
 
 def patchify(x, patch_size):
@@ -1234,14 +1300,15 @@ class AutoencoderKLWan(ModelMixin, AutoencoderMixin, ConfigMixin, FromOriginalMo
         x = self.post_quant_conv(z)
         for i in range(num_frame):
             if i == 0:
-                out, self._feat_map = self.decoder(
+                out, self._feat_map, _ = self.decoder(
                     x[:, :, i : i + 1, :, :],
                     feat_cache=self._feat_map,
                     first_chunk=True,
                 )
             else:
-                out_, self._feat_map = self.decoder(x[:, :, i : i + 1, :, :], feat_cache=self._feat_map)
+                out_, self._feat_map, _ = self.decoder(x[:, :, i : i + 1, :, :], feat_cache=self._feat_map)
                 out = torch.cat([out, out_], 2)
+
             # Prevent jit optmization run multi-step loops simultaneous and cause OOM.
             # Add the dependency next x to current out
             # x, out = jax.lax.optimization_barrier(interop.jax_view((x, out)))

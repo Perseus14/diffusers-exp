@@ -589,6 +589,8 @@ class WanPipeline(DiffusionPipeline, WanLoraLoaderMixin):
             if self.transformer is not None
             else self.transformer_2.config.in_channels
         )
+        print("Prepare latents start")
+        latents_start = time.perf_counter()
         latents = self.prepare_latents(
             batch_size * num_videos_per_prompt,
             num_channels_latents,
@@ -600,6 +602,9 @@ class WanPipeline(DiffusionPipeline, WanLoraLoaderMixin):
             generator,
             latents,
         )
+        latents_end = time.perf_counter()
+        print(f"Prepare latents took: {latents_end - latents_start: .6f}s")
+
 
         mask = torch.ones(latents.shape, dtype=torch.float32, device=device)
 

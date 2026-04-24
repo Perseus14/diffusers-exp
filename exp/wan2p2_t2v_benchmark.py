@@ -561,19 +561,19 @@ class WanVAEDecodeWrapper(torch.nn.Module):
         feat_map = [None] * self.conv_num
         
         # CHUNK 1: Prime the cache inside the XLA graph
-        out_0, feat_map = self.decoder(
+        out_0, feat_map, _ = self.decoder(
             x[:, :, 0:1, :, :], 
             feat_cache=feat_map, 
             first_chunk=True
         )
         
         # CHUNK 2: Process the rest (uses the cache directly from TPU memory!)
-        out_rest, _ = self.decoder(
+        out_rest, _, _ = self.decoder(
             x[:, :, 1:, :, :], 
             feat_cache=feat_map, 
             first_chunk=False
         )
-        
+
         out = torch.cat([out_0, out_rest], dim=2)
         
         # Unpatchify directly in the compiled graph
