@@ -262,19 +262,11 @@ def _tpu_custom_attention(query, key, value, mesh, scale=None):
     kv_num_head = key.shape[1]
     kv_seq_len = key.shape[2]
     
-    if (
-        kv_seq_len > 10000
-        and kv_num_head % remain_devices_prod == 0
-        and q_num_head % remain_devices_prod == 0
-    ):
-        q_partition_spec = P(dp_mesh_key, remain_mesh_key, None, None)
-        kv_partition_spec = P(dp_mesh_key, remain_mesh_key, None, None)
-    else:
-        if q_seq_len % remain_devices_prod != 0:
-            query, _ = pad_to_multiple(query, remain_devices_prod, axis=2)
+    if q_seq_len % remain_devices_prod != 0:
+        query, _ = pad_to_multiple(query, remain_devices_prod, axis=2)
 
-        q_partition_spec = P(dp_mesh_key, None, remain_mesh_key, None)
-        kv_partition_spec = P(dp_mesh_key, None, None, None)
+    q_partition_spec = P(dp_mesh_key, None, remain_mesh_key, None)
+    kv_partition_spec = P(dp_mesh_key, None, None, None)
 
     sharded_fn = jax.shard_map(
         _attention_on_slices,
@@ -313,8 +305,12 @@ def _scaled_dot_product_attention(
         assert is_causal is False
         assert enable_gqa is False
         assert scale is None
+        #from functools import partial
         jquery, jkey, jvalue = env.t2j_iso((query, key, value))
         res = _tpu_custom_attention(jquery, jkey, jvalue, mesh, scale=scale)
+        #traced_fn = partial(_tpu_custom_attention, mesh=mesh)
+        #jaxpr = jax.make_jaxpr(traced_fn)(jquery, jkey, jvalue)
+        #print(jaxpr)
         return env.j2t_iso(res)
 
     return jtorch._sdpa_reference(
