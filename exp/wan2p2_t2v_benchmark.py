@@ -7,12 +7,14 @@ os.environ['JAX_CPP_MIN_LOG_LEVEL'] = '3'
 
 import warnings
 warnings.filterwarnings("ignore", message=".*Explicitly requested dtype int64 requested.*")
+warnings.filterwarnings("ignore", message=".*To copy construct from a tensor.*")
+warnings.filterwarnings("ignore", message=".*The given NumPy array is not writable.*")
+warnings.filterwarnings("ignore", message=".*os.fork\(\) was called.*", category=RuntimeWarning)
 
 import warnings
 warnings.filterwarnings("ignore", message=".*Explicitly requested dtype int64 requested.*")
 
 import argparse
-
 from datetime import datetime
 import functools
 import math
@@ -29,13 +31,15 @@ from jax.experimental.pallas.ops.tpu import splash_attention
 
 import torch
 import numpy as np
+from transformers import modeling_outputs
+
 from diffusers import WanPipeline
 from diffusers.utils import export_to_video
 from diffusers.models.autoencoders import vae as diffusers_vae
 from diffusers.models.autoencoders.vae import DecoderOutput
 from diffusers.models import modeling_outputs as diffusers_modeling_outputs
-
-from transformers import modeling_outputs
+from diffusers.models.transformers.transformer_wan import WanAttnProcessor, _get_qkv_projections, _get_added_kv_projections
+from diffusers.models.attention_dispatch import dispatch_attention_fn
 
 import torchax
 from torchax.ops import jaten
@@ -44,8 +48,6 @@ from torchax.ops import ops_registry
 
 # Local file
 import custom_splash_attention_updated as custom_splash_attention
-from diffusers.models.transformers.transformer_wan import WanAttnProcessor, _get_qkv_projections, _get_added_kv_projections
-from diffusers.models.attention_dispatch import dispatch_attention_fn
 
 
 SIZE_CONFIGS = {
