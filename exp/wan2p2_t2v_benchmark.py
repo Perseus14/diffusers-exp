@@ -11,10 +11,6 @@ warnings.filterwarnings("ignore", message=".*To copy construct from a tensor.*")
 warnings.filterwarnings("ignore", message=".*The given NumPy array is not writable.*")
 warnings.filterwarnings("ignore", message=r".*os.fork\(\) was called.*", category=RuntimeWarning)
 
-
-import warnings
-warnings.filterwarnings("ignore", message=".*Explicitly requested dtype int64 requested.*")
-
 import argparse
 from datetime import datetime
 import functools
