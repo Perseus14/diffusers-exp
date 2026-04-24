@@ -5,7 +5,11 @@ os.environ['GLOG_minloglevel'] = '3'
 os.environ['XLA_CPP_MIN_LOG_LEVEL'] = '3'
 os.environ['JAX_CPP_MIN_LOG_LEVEL'] = '3'
 
+import warnings
+warnings.filterwarnings("ignore", message=".*Explicitly requested dtype int64 requested.*")
+
 import argparse
+
 from datetime import datetime
 import functools
 import math
@@ -726,9 +730,10 @@ def main(args: Args):
                     t_input_ids, t_attention_mask = env.j2t_iso((j_input_ids, j_attention_mask))
                     with perf_time("Text Encoder Execution"):
                         res = self.compiled_encoder(t_input_ids, attention_mask=t_attention_mask, **kwargs)
-                        import torch_xla.core.xla_model as xm
-                        xm.mark_step()
+                        env.t2j_iso(res).block_until_ready()
                         return res
+
+
 
 
 
@@ -907,11 +912,12 @@ def main(args: Args):
             def custom_vae_decode(z, return_dict=False):
                 with perf_time("VAE Decode Execution"):
                     out = compiled_vae_decoder(z)
-                    import torch_xla.core.xla_model as xm
-                    xm.mark_step()
+                    env.t2j_iso(out).block_until_ready()
                 if not return_dict:
                     return (out,)
                 return DecoderOutput(sample=out)
+
+
                 
             pipe.vae.decode = custom_vae_decode
 
